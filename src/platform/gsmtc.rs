@@ -1,9 +1,15 @@
 use crossbeam_channel::Sender;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession,
     GlobalSystemMediaTransportControlsSessionManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    MediaPropertiesChangedEventArgs,
+    PlaybackInfoChangedEventArgs,
+    TimelinePropertiesChangedEventArgs,
 };
 use windows::Storage::Streams::DataReader;
 
@@ -68,22 +74,27 @@ impl GsmtcService {
             if let Ok(manager) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
                 .and_then(|op| op.get())
             {
-                // Initial fetch
-                Self::poll_and_send(&manager, &state_tx, hwnd_val);
+                let subscribed = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+                // Initial subscription & fetch
+                Self::subscribe_all_sessions(&manager, &state_tx, hwnd_val, &subscribed);
+                Self::poll_and_send(&manager, &state_tx, hwnd_val, &subscribed);
 
                 // Event subscription: CurrentSessionChanged
                 let state_tx_clone = state_tx.clone();
                 let mgr_clone = manager.clone();
+                let sub_clone = subscribed.clone();
                 let _ = manager.CurrentSessionChanged(&TypedEventHandler::new(
                     move |_mgr: &Option<GlobalSystemMediaTransportControlsSessionManager>, _args| {
-                        Self::poll_and_send(&mgr_clone, &state_tx_clone, hwnd_val);
+                        Self::subscribe_all_sessions(&mgr_clone, &state_tx_clone, hwnd_val, &sub_clone);
+                        Self::poll_and_send(&mgr_clone, &state_tx_clone, hwnd_val, &sub_clone);
                         Ok(())
                     },
                 ));
 
-                // Command listener loop with periodic sync
+                // Command listener loop with long safety-heartbeat (events provide <1ms push)
                 loop {
-                    match cmd_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                    match cmd_rx.recv_timeout(std::time::Duration::from_secs(3)) {
                         Ok(cmd) => {
                             if let Some(session) = Self::pick_session(&manager) {
                                 match cmd {
@@ -109,11 +120,13 @@ impl GsmtcService {
                                             .map(|op| op.get());
                                     }
                                 }
-                                Self::poll_and_send(&manager, &state_tx, hwnd_val);
+                                Self::poll_and_send(&manager, &state_tx, hwnd_val, &subscribed);
                             }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                            Self::poll_and_send(&manager, &state_tx, hwnd_val);
+                            // Periodic sync to refresh sessions and timeline drift
+                            Self::subscribe_all_sessions(&manager, &state_tx, hwnd_val, &subscribed);
+                            Self::poll_and_send(&manager, &state_tx, hwnd_val, &subscribed);
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
@@ -122,6 +135,75 @@ impl GsmtcService {
         });
 
         Ok(Self { cmd_tx })
+    }
+
+    fn subscribe_session(
+        session: &GlobalSystemMediaTransportControlsSession,
+        manager: &GlobalSystemMediaTransportControlsSessionManager,
+        state_tx: &Sender<MediaState>,
+        hwnd_val: isize,
+        subscribed: &Arc<Mutex<HashSet<String>>>,
+    ) {
+        let app_id = session
+            .SourceAppUserModelId()
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+
+        if app_id.is_empty() {
+            return;
+        }
+
+        let mut sub_lock = subscribed.lock().unwrap();
+        if sub_lock.insert(app_id) {
+            let tx1 = state_tx.clone();
+            let mgr1 = manager.clone();
+            let sub1 = subscribed.clone();
+            let _ = session.MediaPropertiesChanged(&TypedEventHandler::new(
+                move |_s: &Option<GlobalSystemMediaTransportControlsSession>, _args: &Option<MediaPropertiesChangedEventArgs>| {
+                    Self::poll_and_send(&mgr1, &tx1, hwnd_val, &sub1);
+                    Ok(())
+                },
+            ));
+
+            let tx2 = state_tx.clone();
+            let mgr2 = manager.clone();
+            let sub2 = subscribed.clone();
+            let _ = session.PlaybackInfoChanged(&TypedEventHandler::new(
+                move |_s: &Option<GlobalSystemMediaTransportControlsSession>, _args: &Option<PlaybackInfoChangedEventArgs>| {
+                    Self::poll_and_send(&mgr2, &tx2, hwnd_val, &sub2);
+                    Ok(())
+                },
+            ));
+
+            let tx3 = state_tx.clone();
+            let mgr3 = manager.clone();
+            let sub3 = subscribed.clone();
+            let _ = session.TimelinePropertiesChanged(&TypedEventHandler::new(
+                move |_s: &Option<GlobalSystemMediaTransportControlsSession>, _args: &Option<TimelinePropertiesChangedEventArgs>| {
+                    Self::poll_and_send(&mgr3, &tx3, hwnd_val, &sub3);
+                    Ok(())
+                },
+            ));
+        }
+    }
+
+    fn subscribe_all_sessions(
+        manager: &GlobalSystemMediaTransportControlsSessionManager,
+        state_tx: &Sender<MediaState>,
+        hwnd_val: isize,
+        subscribed: &Arc<Mutex<HashSet<String>>>,
+    ) {
+        if let Ok(sessions) = manager.GetSessions() {
+            let count = sessions.Size().unwrap_or(0);
+            for i in 0..count {
+                if let Ok(s) = sessions.GetAt(i) {
+                    Self::subscribe_session(&s, manager, state_tx, hwnd_val, subscribed);
+                }
+            }
+        }
+        if let Ok(current) = manager.GetCurrentSession() {
+            Self::subscribe_session(&current, manager, state_tx, hwnd_val, subscribed);
+        }
     }
 
     fn pick_session(
@@ -175,8 +257,10 @@ impl GsmtcService {
         manager: &GlobalSystemMediaTransportControlsSessionManager,
         state_tx: &Sender<MediaState>,
         hwnd_val: isize,
+        subscribed: &Arc<Mutex<HashSet<String>>>,
     ) {
         if let Some(session) = Self::pick_session(manager) {
+            Self::subscribe_session(&session, manager, state_tx, hwnd_val, subscribed);
             let mut state = MediaState::default();
 
             if let Ok(info) = session.GetPlaybackInfo() {

@@ -132,9 +132,9 @@ fn run_app() -> windows::core::Result<()> {
 
     // 1. Enforce single instance lock via Win32 Named Mutex
     let _mutex = unsafe {
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
         let m = CreateMutexW(None, true, w!("Local\\MyIslandSingleInstanceRust"));
         let err = windows::Win32::Foundation::GetLastError();
-        let _ = std::fs::write("launch.log", format!("mutex created, err={:?}\n", err));
         if err == windows::Win32::Foundation::ERROR_ALREADY_EXISTS {
             return Ok(());
         }
