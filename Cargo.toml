@@ -1,0 +1,47 @@
+[package]
+name = "myisland"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows = { version = "0.58.0", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
+    "Win32_Security",
+    "ApplicationModel",
+    "Media_Control",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "UI_Notifications",
+    "UI_Notifications_Management",
+] }
+tiny-skia = "0.11"
+fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+crossbeam-channel = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
