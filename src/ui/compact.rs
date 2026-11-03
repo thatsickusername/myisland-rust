@@ -137,8 +137,7 @@ impl CompactRenderer {
             }
 
             // Title & Subtitle
-            // These are the same baseline coordinates as the Electron canvas:
-            // title at cy-2, body at cy+14, and a single line at cy+4.
+            // Refined baseline coordinates for proper vertical centering
             let text_left = avatar_x + avatar_size + 14.0;
             let right_margin = right - 4.0;
             let text_available_right = right_margin - 40.0;
@@ -149,11 +148,12 @@ impl CompactRenderer {
             if !notif.subtitle.is_empty() {
                 let title = canvas.truncate_to_width(&notif.title, text_max_width, 13.5, true);
                 let subtitle = canvas.truncate_to_width(&notif.subtitle, text_max_width, 12.5, false);
-                canvas.draw_text(&title, text_left, cy - 2.0, 13.5, text_col_white, true);
-                canvas.draw_text(&subtitle, text_left, cy + 14.0, 12.5, text_col_sub, false);
+                // Shifted up by 8px to account for the top-origin text rendering math
+                canvas.draw_text(&title, text_left, cy - 14.0, 13.5, text_col_white, true);
+                canvas.draw_text(&subtitle, text_left, cy + 2.0, 12.5, text_col_sub, false);
             } else {
                 let title = canvas.truncate_to_width(&notif.title, text_max_width, 13.5, true);
-                canvas.draw_text(&title, text_left, cy + 4.0, 13.5, text_col_white, true);
+                canvas.draw_text(&title, text_left, cy - 7.0, 13.5, text_col_white, true);
             }
 
             // Time & Dismiss icon
@@ -162,7 +162,7 @@ impl CompactRenderer {
             canvas.draw_text(
                 &notif.time_text,
                 right - 24.0 - time_width,
-                cy - 2.0,
+                cy - 14.0,
                 12.0,
                 time_col,
                 false,
@@ -588,6 +588,21 @@ impl CompactRenderer {
             Color::WHITE
         };
 
+        // Use native Windows icons for specified hardware, fallback to vectors for software
+        if app.contains("controller") || app.contains("gamepad") {
+            canvas.draw_icon_centered('\u{E75E}', cx, cy, size * 1.15, icon_color);
+            return;
+        }
+        if app.contains("headphone") || app.contains("speaker") || app.contains("buds") || app.contains("earbud") {
+            let icon_char = if app.contains("speaker") {
+                '\u{E7F5}'
+            } else {
+                '\u{E7F6}'
+            };
+            canvas.draw_icon_centered(icon_char, cx, cy, size * 1.05, icon_color);
+            return;
+        }
+
         let mut paint = Paint::default();
         paint.anti_alias = true;
         paint.set_color(icon_color);
@@ -599,32 +614,7 @@ impl CompactRenderer {
         };
 
         let mut pb = PathBuilder::new();
-        if app.contains("controller") || app.contains("gamepad") {
-            let w = size * 1.35;
-            let h = size * 0.9;
-            if let Some(rect) = tiny_skia::Rect::from_xywh(
-                cx - w / 2.0,
-                cy - h / 2.0,
-                w,
-                h,
-            ) {
-                pb.push_rect(rect);
-            }
-            pb.move_to(cx - size * 0.28, cy);
-            pb.line_to(cx - size * 0.02, cy);
-            pb.move_to(cx - size * 0.15, cy - size * 0.13);
-            pb.line_to(cx - size * 0.15, cy + size * 0.13);
-            pb.push_circle(cx + size * 0.25, cy - size * 0.08, size * 0.07);
-            pb.push_circle(cx + size * 0.36, cy + size * 0.11, size * 0.07);
-        } else if app.contains("headphone") || app.contains("speaker") {
-            let r = size * 0.48;
-            pb.move_to(cx - r, cy - 2.0);
-            pb.cubic_to(cx - r, cy - r, cx + r, cy - r, cx + r, cy - 2.0);
-            pb.move_to(cx - r - 3.0, cy - 3.0);
-            pb.line_to(cx - r - 3.0, cy + 8.0);
-            pb.move_to(cx + r + 3.0, cy - 3.0);
-            pb.line_to(cx + r + 3.0, cy + 8.0);
-        } else if app.contains("bluetooth") {
+        if app.contains("bluetooth") {
             let h = size * 0.95;
             pb.move_to(cx, cy - h / 2.0);
             pb.line_to(cx, cy + h / 2.0);

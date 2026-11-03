@@ -19,6 +19,7 @@ struct GlyphKey {
     ch: char,
     size_bits: u32,
     bold: bool,
+    icon: bool,
 }
 
 struct CachedGlyph {
@@ -37,6 +38,7 @@ pub struct LayeredCanvas {
     pub mask: Mask,
     pub font_regular: Option<Arc<Font>>,
     pub font_bold: Option<Arc<Font>>,
+    pub font_icon: Option<Arc<Font>>,
     glyph_cache: HashMap<GlyphKey, CachedGlyph>,
 }
 
@@ -100,6 +102,15 @@ impl LayeredCanvas {
                 .map(Arc::new)
                 .or_else(|| font_regular.clone());
 
+            // Load standard Windows icons (Segoe MDL2 / Fluent)
+            let icon_path = fonts_dir.join("segmdl2.ttf");
+            let icon_bytes = fs::read(&icon_path);
+            let font_icon = icon_bytes
+                .as_ref()
+                .ok()
+                .and_then(|data| Font::from_bytes(&data[..], FontSettings::default()).ok())
+                .map(Arc::new);
+
             // Pre-warm glyph cache for instant, zero-stutter first-frame rendering
             let mut glyph_cache = HashMap::with_capacity(512);
             let common_sizes = [9.5f32, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0];
@@ -108,13 +119,13 @@ impl LayeredCanvas {
                 if let Some(ref f) = font_regular {
                     for ch in prewarm_chars.chars() {
                         let (metrics, bitmap) = f.rasterize(ch, size);
-                        glyph_cache.insert(GlyphKey { ch, size_bits: size.to_bits(), bold: false }, CachedGlyph { metrics, bitmap });
+                        glyph_cache.insert(GlyphKey { ch, size_bits: size.to_bits(), bold: false, icon: false }, CachedGlyph { metrics, bitmap });
                     }
                 }
                 if let Some(ref f) = font_bold {
                     for ch in prewarm_chars.chars() {
                         let (metrics, bitmap) = f.rasterize(ch, size);
-                        glyph_cache.insert(GlyphKey { ch, size_bits: size.to_bits(), bold: true }, CachedGlyph { metrics, bitmap });
+                        glyph_cache.insert(GlyphKey { ch, size_bits: size.to_bits(), bold: true, icon: false }, CachedGlyph { metrics, bitmap });
                     }
                 }
             }
@@ -130,6 +141,7 @@ impl LayeredCanvas {
                 mask,
                 font_regular,
                 font_bold,
+                font_icon,
                 glyph_cache,
             })
         }
@@ -289,6 +301,7 @@ impl LayeredCanvas {
                 ch,
                 size_bits: size.to_bits(),
                 bold,
+                icon: false,
             };
 
             let cached = self.glyph_cache.entry(key).or_insert_with(|| {
@@ -349,6 +362,79 @@ impl LayeredCanvas {
             }
 
             curr_x += metrics.advance_width;
+        }
+    }
+
+    pub fn draw_icon_centered(
+        &mut self,
+        ch: char,
+        cx: f32,
+        cy: f32,
+        size: f32,
+        color: Color,
+    ) {
+        let font = match self.font_icon.as_ref() {
+            Some(f) => f.clone(),
+            None => return,
+        };
+
+        let key = GlyphKey {
+            ch,
+            size_bits: size.to_bits(),
+            bold: false,
+            icon: true,
+        };
+
+        let cached = self.glyph_cache.entry(key).or_insert_with(|| {
+            let (metrics, bitmap) = font.rasterize(ch, size);
+            CachedGlyph { metrics, bitmap }
+        });
+
+        let metrics = cached.metrics;
+        let gx = cx - (metrics.width as f32) / 2.0;
+        let gy = cy - (metrics.height as f32) / 2.0;
+
+        let bitmap = &cached.bitmap;
+        let pm_buf = self.pixmap.data_mut();
+        let pm_w = self.width as usize;
+        let pm_h = self.height as usize;
+
+        for row in 0..metrics.height {
+            let py_f = gy + row as f32;
+            if py_f < 0.0 || py_f >= pm_h as f32 {
+                continue;
+            }
+            let py = py_f as usize;
+            for col in 0..metrics.width {
+                let px_f = gx + col as f32;
+                if px_f < 0.0 || px_f >= pm_w as f32 {
+                    continue;
+                }
+                let px = px_f as usize;
+                let alpha_val = bitmap[row * metrics.width + col];
+                if alpha_val == 0 {
+                    continue;
+                }
+
+                let a_norm = (alpha_val as f32 / 255.0) * color.alpha();
+                let idx = (py * pm_w + px) * 4;
+
+                let r_pre = (color.red() * 255.0 * a_norm) as u32;
+                let g_pre = (color.green() * 255.0 * a_norm) as u32;
+                let b_pre = (color.blue() * 255.0 * a_norm) as u32;
+                let a_pre = (a_norm * 255.0) as u32;
+
+                let dst_r = pm_buf[idx] as u32;
+                let dst_g = pm_buf[idx + 1] as u32;
+                let dst_b = pm_buf[idx + 2] as u32;
+                let dst_a = pm_buf[idx + 3] as u32;
+
+                let inv_a = 255 - a_pre;
+                pm_buf[idx] = (r_pre + (dst_r * inv_a) / 255).min(255) as u8;
+                pm_buf[idx + 1] = (g_pre + (dst_g * inv_a) / 255).min(255) as u8;
+                pm_buf[idx + 2] = (b_pre + (dst_b * inv_a) / 255).min(255) as u8;
+                pm_buf[idx + 3] = (a_pre + (dst_a * inv_a) / 255).min(255) as u8;
+            }
         }
     }
 
