@@ -125,4 +125,109 @@ impl ClipboardManager {
             }
         }
     }
+
+    /// Read the current Windows clipboard bitmap as PNG bytes.
+    ///
+    /// Snipping Tool places the captured image on the clipboard immediately
+    /// before emitting its toast. Keeping this conversion native lets the
+    /// expanded notification card show the same preview as the Electron app
+    /// without writing a temporary screenshot file.
+    pub fn read_clipboard_image_png() -> Option<Vec<u8>> {
+        unsafe {
+            use windows::Win32::Foundation::HGLOBAL;
+            use windows::Win32::System::DataExchange::*;
+            use windows::Win32::System::Memory::*;
+
+            if OpenClipboard(None).is_err() {
+                return None;
+            }
+
+            let handle = GetClipboardData(17) // CF_DIBV5
+                .or_else(|_| GetClipboardData(8)) // CF_DIB
+                .ok();
+            let Some(handle) = handle else {
+                let _ = CloseClipboard();
+                return None;
+            };
+
+            let global = HGLOBAL(handle.0);
+            let ptr = GlobalLock(global) as *const u8;
+            let total = GlobalSize(global);
+            let result = if ptr.is_null() || total < 40 {
+                None
+            } else {
+                let header = std::slice::from_raw_parts(ptr, total);
+                let header_size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+                let width = i32::from_le_bytes(header[4..8].try_into().unwrap());
+                let height_raw = i32::from_le_bytes(header[8..12].try_into().unwrap());
+                let bit_count = u16::from_le_bytes(header[14..16].try_into().unwrap());
+                let compression = u32::from_le_bytes(header[16..20].try_into().unwrap());
+                let clr_used = u32::from_le_bytes(header[32..36].try_into().unwrap()) as usize;
+
+                if width <= 0
+                    || height_raw == 0
+                    || width > 8192
+                    || height_raw.unsigned_abs() > 8192
+                    || (bit_count != 24 && bit_count != 32)
+                    || (compression != 0 && compression != 3)
+                {
+                    None
+                } else {
+                    let width_u = width as usize;
+                    let height_u = height_raw.unsigned_abs() as usize;
+                    let top_down = height_raw < 0;
+                    let bytes_per_pixel = (bit_count / 8) as usize;
+                    let stride = ((width_u * bytes_per_pixel + 3) / 4) * 4;
+                    let mask_bytes = if compression == 3 && header_size == 40 { 12 } else { 0 };
+                    let palette_entries = if bit_count <= 8 {
+                        if clr_used > 0 { clr_used } else { 1usize << bit_count }
+                    } else {
+                        0
+                    };
+                    let pixels_offset = header_size
+                        .saturating_add(mask_bytes)
+                        .saturating_add(palette_entries * 4);
+                    let needed = pixels_offset.saturating_add(stride.saturating_mul(height_u));
+
+                    if pixels_offset >= total || needed > total {
+                        None
+                    } else {
+                        let mut rgba = image::RgbaImage::new(width as u32, height_u as u32);
+                        for y in 0..height_u {
+                            let source_y = if top_down { y } else { height_u - 1 - y };
+                            let row = pixels_offset + source_y * stride;
+                            for x in 0..width_u {
+                                let px = row + x * bytes_per_pixel;
+                                let b = header[px];
+                                let g = header[px + 1];
+                                let r = header[px + 2];
+                                let a = if bytes_per_pixel == 4 && header[px + 3] != 0 {
+                                    header[px + 3]
+                                } else {
+                                    255
+                                };
+                                rgba.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, a]));
+                            }
+                        }
+
+                        let mut output = std::io::Cursor::new(Vec::new());
+                        if image::DynamicImage::ImageRgba8(rgba)
+                            .write_to(&mut output, image::ImageFormat::Png)
+                            .is_ok()
+                        {
+                            Some(output.into_inner())
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+
+            if !ptr.is_null() {
+                let _ = GlobalUnlock(global);
+            }
+            let _ = CloseClipboard();
+            result
+        }
+    }
 }

@@ -1,13 +1,382 @@
 use crate::platform::MediaState;
 use crate::render::{AlbumArtManager, LayeredCanvas, MascotEngine};
-use crate::state::{clean_title_and_artist, ClipboardManager, LyricsState};
-use tiny_skia::{Color, Paint, PathBuilder, Stroke, Transform};
+use crate::state::{clean_title_and_artist, ClipboardManager, LyricsState, NotificationPayload};
+use tiny_skia::{Color, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
 
 pub const APP_NAMES: [&str; 4] = ["MUSIC", "CLIPBOARD", "NOTES", "FOCUS"];
 
 pub struct ExpandedRenderer;
 
 impl ExpandedRenderer {
+    /// Native equivalent of the Electron expanded notification card. The
+    /// compact banner is rendered by CompactRenderer; this path is used after
+    /// a snipping-tool/call notification receives a hover dwell.
+    pub fn render_notification(
+        canvas: &mut LayeredCanvas,
+        notif: &NotificationPayload,
+        island_x: f32,
+        w: f32,
+        _h: f32,
+        pointer_x: f32,
+        pointer_y: f32,
+    ) -> bool {
+        let left = island_x + 22.0;
+        let top = 18.0;
+        let brand = Color::from_rgba8(
+            notif.brand_color[0],
+            notif.brand_color[1],
+            notif.brand_color[2],
+            notif.brand_color[3],
+        );
+
+        // Header avatar.
+        let mut avatar_bg = Paint::default();
+        avatar_bg.anti_alias = true;
+        avatar_bg.set_color(brand);
+        let mut avatar_path = PathBuilder::new();
+        avatar_path.push_circle(left + 16.0, top + 16.0, 16.0);
+        if let Some(path) = avatar_path.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &avatar_bg,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        if let Some(bytes) = notif.avatar_image.as_ref().or(notif.icon_image.as_ref()) {
+            let _ = Self::draw_notification_image(
+                canvas,
+                bytes,
+                left + 16.0,
+                top + 16.0,
+                32.0,
+                notif.avatar_image.is_some(),
+            );
+        }
+        canvas.draw_text(
+            &notif.app_name,
+            left + 40.0,
+            top + 12.0,
+            13.5,
+            Color::WHITE,
+            true,
+        );
+        canvas.draw_text(
+            if notif.is_call { "Phone Link" } else { &notif.subtitle },
+            left + 40.0,
+            top + 28.0,
+            11.0,
+            Color::from_rgba8(142, 142, 147, 255),
+            false,
+        );
+
+        // Close affordance.
+        let close_x = island_x + w - 27.0;
+        let close_y = top + 16.0;
+        let mut close_bg = Paint::default();
+        close_bg.anti_alias = true;
+        let close_hover = pointer_x >= close_x - 14.0
+            && pointer_x <= close_x + 14.0
+            && pointer_y >= close_y - 14.0
+            && pointer_y <= close_y + 14.0;
+        close_bg.set_color_rgba8(255, 255, 255, if close_hover { 58 } else { 30 });
+        let mut close_path = PathBuilder::new();
+        close_path.push_circle(close_x, close_y, 11.0);
+        if let Some(path) = close_path.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &close_bg,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        let mut close_lines = PathBuilder::new();
+        close_lines.move_to(close_x - 3.5, close_y - 3.5);
+        close_lines.line_to(close_x + 3.5, close_y + 3.5);
+        close_lines.move_to(close_x + 3.5, close_y - 3.5);
+        close_lines.line_to(close_x - 3.5, close_y + 3.5);
+        let close_paint = {
+            let mut p = Paint::default();
+            p.anti_alias = true;
+            p.set_color_rgba8(255, 255, 255, 210);
+            p
+        };
+        if let Some(path) = close_lines.finish() {
+            canvas.pixmap.stroke_path(
+                &path,
+                &close_paint,
+                &Stroke { width: 1.6, line_cap: tiny_skia::LineCap::Round, ..Default::default() },
+                Transform::identity(),
+                None,
+            );
+        }
+
+        let body_y = 54.0;
+        if notif.is_snip {
+            // Screenshot preview surface. The clipboard image is collected by
+            // the main thread when available; otherwise keep the same
+            // intentional loading/placeholder treatment as Electron.
+            let preview_x = left;
+            let preview_y = body_y;
+            let preview_w = 160.0;
+            let preview_h = 94.0;
+            let mut preview_bg = Paint::default();
+            preview_bg.anti_alias = true;
+            preview_bg.set_color_rgba8(28, 28, 30, 255);
+            let mut preview_path = PathBuilder::new();
+            Self::add_round_rect(
+                &mut preview_path,
+                preview_x,
+                preview_y,
+                preview_w,
+                preview_h,
+                10.0,
+            );
+            let preview_shape = preview_path.finish();
+            if let Some(path) = preview_shape.as_ref() {
+                canvas.pixmap.fill_path(
+                    &path,
+                    &preview_bg,
+                    tiny_skia::FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+
+            if let (Some(bytes), Some(path)) = (notif.image_preview.as_ref(), preview_shape.as_ref()) {
+                if let Ok(image) = image::load_from_memory(bytes) {
+                    let rgba = image.to_rgba8();
+                    if let Some(mut image_pixmap) = Pixmap::new(rgba.width(), rgba.height()) {
+                        for (source, target) in rgba
+                            .as_raw()
+                            .chunks_exact(4)
+                            .zip(image_pixmap.data_mut().chunks_exact_mut(4))
+                        {
+                            let alpha = source[3] as u16;
+                            target[0] = ((source[0] as u16 * alpha) / 255) as u8;
+                            target[1] = ((source[1] as u16 * alpha) / 255) as u8;
+                            target[2] = ((source[2] as u16 * alpha) / 255) as u8;
+                            target[3] = source[3];
+                        }
+                        let transform = Transform::from_scale(
+                            preview_w / image_pixmap.width() as f32,
+                            preview_h / image_pixmap.height() as f32,
+                        )
+                        .post_translate(preview_x, preview_y);
+                        let mut image_paint = Paint::default();
+                        image_paint.anti_alias = true;
+                        image_paint.shader = Pattern::new(
+                            image_pixmap.as_ref(),
+                            SpreadMode::Pad,
+                            FilterQuality::Bilinear,
+                            1.0,
+                            transform,
+                        );
+                        canvas.pixmap.fill_path(
+                            path,
+                            &image_paint,
+                            tiny_skia::FillRule::Winding,
+                            Transform::identity(),
+                            None,
+                        );
+                    }
+                }
+            }
+            let mut preview_border = Paint::default();
+            preview_border.anti_alias = true;
+            preview_border.set_color_rgba8(100, 210, 255, 145);
+            let mut border_path = PathBuilder::new();
+            Self::add_round_rect(
+                &mut border_path,
+                preview_x + 0.5,
+                preview_y + 0.5,
+                preview_w - 1.0,
+                preview_h - 1.0,
+                9.5,
+            );
+            if let Some(path) = border_path.finish() {
+                canvas.pixmap.stroke_path(
+                    &path,
+                    &preview_border,
+                    &Stroke { width: 1.0, ..Default::default() },
+                    Transform::identity(),
+                    None,
+                );
+            }
+            if notif.image_preview.is_none() {
+                canvas.draw_text(
+                    "Preview unavailable",
+                    preview_x + 20.0,
+                    preview_y + preview_h / 2.0,
+                    11.0,
+                    Color::from_rgba8(255, 255, 255, 165),
+                    false,
+                );
+            }
+
+            let action_x = left + 176.0;
+            Self::draw_notification_button(
+                canvas,
+                "Open Screenshot",
+                action_x,
+                body_y + 10.0,
+                w - 44.0 - 176.0,
+                38.0,
+                Color::from_rgba8(0, 122, 255, 255),
+            );
+            Self::draw_notification_button(
+                canvas,
+                "Copy Image",
+                action_x,
+                body_y + 56.0,
+                w - 44.0 - 176.0,
+                38.0,
+                Color::from_rgba8(255, 255, 255, 31),
+            );
+        } else {
+            // Incoming call card.
+            canvas.draw_text(
+                &notif.title,
+                left,
+                body_y + 8.0,
+                20.0,
+                Color::WHITE,
+                true,
+            );
+            canvas.draw_text(
+                &notif.subtitle,
+                left,
+                body_y + 30.0,
+                12.5,
+                Color::from_rgba8(235, 235, 245, 210),
+                false,
+            );
+            let button_w = (w - 66.0) / 2.0;
+            Self::draw_notification_button(
+                canvas,
+                "Accept on PC",
+                left,
+                body_y + 55.0,
+                button_w,
+                42.0,
+                Color::from_rgba8(48, 209, 88, 255),
+            );
+            Self::draw_notification_button(
+                canvas,
+                "Decline",
+                left + button_w + 18.0,
+                body_y + 55.0,
+                button_w,
+                42.0,
+                Color::from_rgba8(255, 69, 58, 255),
+            );
+        }
+
+        false
+    }
+
+    fn draw_notification_button(
+        canvas: &mut LayeredCanvas,
+        label: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: Color,
+    ) {
+        let mut bg = Paint::default();
+        bg.anti_alias = true;
+        bg.set_color(color);
+        let mut pb = PathBuilder::new();
+        Self::add_round_rect(&mut pb, x, y, w, h, 12.0);
+        if let Some(path) = pb.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &bg,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+        let tw = canvas.measure_text_width(label, 12.5, true);
+        // draw_text receives a baseline, not a top edge. Center the glyph's
+        // baseline in the button instead of placing it at y+12.
+        canvas.draw_text(
+            label,
+            x + (w - tw) / 2.0,
+            y + h / 2.0 + 4.5,
+            12.5,
+            Color::WHITE,
+            true,
+        );
+    }
+
+    fn draw_notification_image(
+        canvas: &mut LayeredCanvas,
+        bytes: &[u8],
+        cx: f32,
+        cy: f32,
+        size: f32,
+        cover: bool,
+    ) -> bool {
+        let Ok(image) = image::load_from_memory(bytes) else {
+            return false;
+        };
+        let rgba = image.to_rgba8();
+        let Some(mut pixmap) = Pixmap::new(rgba.width(), rgba.height()) else {
+            return false;
+        };
+        for (source, target) in rgba
+            .as_raw()
+            .chunks_exact(4)
+            .zip(pixmap.data_mut().chunks_exact_mut(4))
+        {
+            let alpha = source[3] as u16;
+            target[0] = ((source[0] as u16 * alpha) / 255) as u8;
+            target[1] = ((source[1] as u16 * alpha) / 255) as u8;
+            target[2] = ((source[2] as u16 * alpha) / 255) as u8;
+            target[3] = source[3];
+        }
+        let image_w = pixmap.width() as f32;
+        let image_h = pixmap.height() as f32;
+        let scale = if cover {
+            (size / image_w).max(size / image_h)
+        } else {
+            (size / image_w).min(size / image_h)
+        };
+        let draw_w = image_w * scale;
+        let draw_h = image_h * scale;
+        let transform = Transform::from_scale(scale, scale).post_translate(
+            cx - draw_w / 2.0,
+            cy - draw_h / 2.0,
+        );
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.shader = Pattern::new(
+            pixmap.as_ref(),
+            SpreadMode::Pad,
+            FilterQuality::Bilinear,
+            1.0,
+            transform,
+        );
+        let mut clip = PathBuilder::new();
+        clip.push_circle(cx, cy, size / 2.0);
+        if let Some(path) = clip.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn render(
         canvas: &mut LayeredCanvas,
         mascot: &mut MascotEngine,

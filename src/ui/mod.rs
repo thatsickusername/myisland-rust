@@ -6,7 +6,8 @@ pub use compact::CompactRenderer;
 pub use expanded::ExpandedRenderer;
 pub use tray::{
     TrayIcon, WM_TRAYICON, IDM_QUIT, IDM_TEST_CALL, IDM_TEST_DISCORD, IDM_TEST_SNIP,
-    IDM_TEST_WHATSAPP, IDM_TOGGLE_EXPAND, IDM_TUCK_AWAY,
+    IDM_TEST_WHATSAPP, IDM_TEST_CONTROLLER, IDM_TEST_HEADPHONES,
+    IDM_TEST_SPEAKER_DISCONNECT, IDM_TOGGLE_EXPAND, IDM_TUCK_AWAY,
 };
 
 pub fn format_focus_timer(ms: u64) -> String {

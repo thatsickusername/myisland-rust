@@ -1,6 +1,6 @@
 use crate::render::{AlbumArtManager, LayeredCanvas, MascotEngine, Visualizer};
 use crate::state::{ActivityType, LyricsState, NotificationPayload};
-use tiny_skia::{Color, Paint, PathBuilder, Stroke, Transform};
+use tiny_skia::{Color, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
 
 pub struct CompactRenderer;
 
@@ -66,12 +66,16 @@ impl CompactRenderer {
             // Avatar background
             let mut paint = Paint::default();
             paint.anti_alias = true;
-            paint.set_color_rgba8(
-                notif.brand_color[0],
-                notif.brand_color[1],
-                notif.brand_color[2],
-                notif.brand_color[3],
-            );
+            if notif.is_device {
+                paint.set_color_rgba8(28, 28, 30, 255);
+            } else {
+                paint.set_color_rgba8(
+                    notif.brand_color[0],
+                    notif.brand_color[1],
+                    notif.brand_color[2],
+                    notif.brand_color[3],
+                );
+            }
 
             let mut pb = PathBuilder::new();
             pb.push_circle(avatar_x + avatar_size / 2.0, cy, avatar_size / 2.0);
@@ -85,21 +89,84 @@ impl CompactRenderer {
                 );
             }
 
+            // Prefer the actual toast avatar/app icon. The original Electron
+            // implementation used the toast image first, then the resolved
+            // application icon, and only then its vector fallback.
+            let icon_drawn = notif
+                .avatar_image
+                .as_ref()
+                .and_then(|bytes| {
+                    Self::draw_notification_image(
+                        canvas,
+                        bytes,
+                        avatar_x + avatar_size / 2.0,
+                        cy,
+                        avatar_size,
+                        true,
+                    )
+                    .then_some(())
+                })
+                .is_some()
+                || notif
+                    .icon_image
+                    .as_ref()
+                    .and_then(|bytes| {
+                        Self::draw_notification_image(
+                            canvas,
+                            bytes,
+                            avatar_x + avatar_size / 2.0,
+                            cy,
+                            avatar_size,
+                            false,
+                        )
+                        .then_some(())
+                    })
+                    .is_some();
+
+            if !icon_drawn {
+                Self::draw_notification_icon(
+                    canvas,
+                    &notif.badge_app,
+                    avatar_x + avatar_size / 2.0,
+                    cy,
+                    19.0,
+                    notif.is_snip,
+                    notif.is_device,
+                    notif.brand_color,
+                );
+            }
+
             // Title & Subtitle
-            let text_left = avatar_x + avatar_size + 12.0;
+            // These are the same baseline coordinates as the Electron canvas:
+            // title at cy-2, body at cy+14, and a single line at cy+4.
+            let text_left = avatar_x + avatar_size + 14.0;
+            let right_margin = right - 4.0;
+            let text_available_right = right_margin - 40.0;
+            let text_max_width = (text_available_right - text_left - 10.0).max(140.0);
             let text_col_white = Color::from_rgba8(255, 255, 255, 255);
             let text_col_sub = Color::from_rgba8(235, 235, 245, 185);
 
             if !notif.subtitle.is_empty() {
-                canvas.draw_text(&notif.title, text_left, cy - 8.0, 13.5, text_col_white, true);
-                canvas.draw_text(&notif.subtitle, text_left, cy + 6.0, 12.0, text_col_sub, false);
+                let title = canvas.truncate_to_width(&notif.title, text_max_width, 13.5, true);
+                let subtitle = canvas.truncate_to_width(&notif.subtitle, text_max_width, 12.5, false);
+                canvas.draw_text(&title, text_left, cy - 2.0, 13.5, text_col_white, true);
+                canvas.draw_text(&subtitle, text_left, cy + 14.0, 12.5, text_col_sub, false);
             } else {
-                canvas.draw_text(&notif.title, text_left, cy - 3.0, 13.5, text_col_white, true);
+                let title = canvas.truncate_to_width(&notif.title, text_max_width, 13.5, true);
+                canvas.draw_text(&title, text_left, cy + 4.0, 13.5, text_col_white, true);
             }
 
             // Time & Dismiss icon
             let time_col = Color::from_rgba8(255, 255, 255, 95);
-            canvas.draw_text(&notif.time_text, right - 32.0, cy - 3.0, 11.5, time_col, false);
+            let time_width = canvas.measure_text_width(&notif.time_text, 12.0, false);
+            canvas.draw_text(
+                &notif.time_text,
+                right - 24.0 - time_width,
+                cy - 2.0,
+                12.0,
+                time_col,
+                false,
+            );
 
             let mut dismiss_paint = Paint::default();
             dismiss_paint.anti_alias = true;
@@ -110,7 +177,21 @@ impl CompactRenderer {
                 ..Default::default()
             };
 
-            let btn_x = right - 6.0;
+            let btn_x = right - 8.0;
+            let mut dismiss_bg = Paint::default();
+            dismiss_bg.anti_alias = true;
+            dismiss_bg.set_color_rgba8(255, 255, 255, 31);
+            let mut dismiss_circle = PathBuilder::new();
+            dismiss_circle.push_circle(btn_x, cy, 9.5);
+            if let Some(path) = dismiss_circle.finish() {
+                canvas.pixmap.fill_path(
+                    &path,
+                    &dismiss_bg,
+                    tiny_skia::FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
             let cr = 3.6;
             let mut pb = PathBuilder::new();
             pb.move_to(btn_x - cr, cy - cr);
@@ -486,6 +567,209 @@ impl CompactRenderer {
 
         // "Copied" text
         canvas.draw_text(text, start_x + icon_size + gap, cy - 7.0, 12.5, green, true);
+    }
+
+    fn draw_notification_icon(
+        canvas: &mut LayeredCanvas,
+        badge_app: &str,
+        cx: f32,
+        cy: f32,
+        size: f32,
+        is_snip: bool,
+        is_device: bool,
+        brand_color: [u8; 4],
+    ) {
+        let app = badge_app.to_lowercase();
+        let icon_color = if is_device {
+            Color::from_rgba8(brand_color[0], brand_color[1], brand_color[2], brand_color[3])
+        } else if is_snip {
+            Color::from_rgba8(100, 210, 255, 255)
+        } else {
+            Color::WHITE
+        };
+
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(icon_color);
+        let stroke = Stroke {
+            width: 1.8,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+
+        let mut pb = PathBuilder::new();
+        if app.contains("controller") || app.contains("gamepad") {
+            let w = size * 1.35;
+            let h = size * 0.9;
+            if let Some(rect) = tiny_skia::Rect::from_xywh(
+                cx - w / 2.0,
+                cy - h / 2.0,
+                w,
+                h,
+            ) {
+                pb.push_rect(rect);
+            }
+            pb.move_to(cx - size * 0.28, cy);
+            pb.line_to(cx - size * 0.02, cy);
+            pb.move_to(cx - size * 0.15, cy - size * 0.13);
+            pb.line_to(cx - size * 0.15, cy + size * 0.13);
+            pb.push_circle(cx + size * 0.25, cy - size * 0.08, size * 0.07);
+            pb.push_circle(cx + size * 0.36, cy + size * 0.11, size * 0.07);
+        } else if app.contains("headphone") || app.contains("speaker") {
+            let r = size * 0.48;
+            pb.move_to(cx - r, cy - 2.0);
+            pb.cubic_to(cx - r, cy - r, cx + r, cy - r, cx + r, cy - 2.0);
+            pb.move_to(cx - r - 3.0, cy - 3.0);
+            pb.line_to(cx - r - 3.0, cy + 8.0);
+            pb.move_to(cx + r + 3.0, cy - 3.0);
+            pb.line_to(cx + r + 3.0, cy + 8.0);
+        } else if app.contains("bluetooth") {
+            let h = size * 0.95;
+            pb.move_to(cx, cy - h / 2.0);
+            pb.line_to(cx, cy + h / 2.0);
+            pb.line_to(cx + size * 0.28, cy + h * 0.25);
+            pb.line_to(cx - size * 0.23, cy - h * 0.25);
+            pb.move_to(cx - size * 0.23, cy + h * 0.25);
+            pb.line_to(cx + size * 0.28, cy - h * 0.25);
+            pb.line_to(cx, cy - h / 2.0);
+        } else if app.contains("whatsapp") || app.contains("phone") || app.contains("call") {
+            // Compact handset glyph.
+            pb.move_to(cx - size * 0.28, cy - size * 0.30);
+            pb.cubic_to(
+                cx - size * 0.40,
+                cy - size * 0.15,
+                cx - size * 0.08,
+                cy + size * 0.28,
+                cx + size * 0.22,
+                cy + size * 0.31,
+            );
+            pb.line_to(cx + size * 0.38, cy + size * 0.15);
+            pb.line_to(cx + size * 0.18, cy - size * 0.02);
+            pb.line_to(cx + size * 0.02, cy + size * 0.10);
+            pb.cubic_to(
+                cx - size * 0.08,
+                cy + size * 0.01,
+                cx - size * 0.16,
+                cy - size * 0.09,
+                cx - size * 0.14,
+                cy - size * 0.19,
+            );
+            pb.line_to(cx - size * 0.02, cy - size * 0.35);
+        } else if app.contains("discord") {
+            // Discord-like controller outline with two eyes.
+            if let Some(rect) = tiny_skia::Rect::from_xywh(
+                cx - size * 0.42,
+                cy - size * 0.26,
+                size * 0.84,
+                size * 0.52,
+            ) {
+                pb.push_rect(rect);
+            }
+            pb.push_circle(cx - size * 0.15, cy, size * 0.045);
+            pb.push_circle(cx + size * 0.15, cy, size * 0.045);
+        } else if app.contains("snip") || app.contains("screen") {
+            // Scissors / screenshot mark.
+            pb.push_circle(cx - size * 0.26, cy - size * 0.23, size * 0.12);
+            pb.push_circle(cx - size * 0.26, cy + size * 0.23, size * 0.12);
+            pb.move_to(cx - size * 0.16, cy - size * 0.16);
+            pb.line_to(cx + size * 0.32, cy + size * 0.30);
+            pb.move_to(cx - size * 0.16, cy + size * 0.16);
+            pb.line_to(cx + size * 0.32, cy - size * 0.30);
+        } else if app.contains("slack") {
+            // Four short rounded bars suggest the Slack mark.
+            for offset in [-0.24f32, 0.08] {
+                pb.move_to(cx - size * 0.28, cy + size * offset);
+                pb.line_to(cx + size * 0.28, cy + size * offset);
+            }
+            for offset in [-0.24f32, 0.08] {
+                pb.move_to(cx + size * offset, cy - size * 0.28);
+                pb.line_to(cx + size * offset, cy + size * 0.28);
+            }
+        } else {
+            // Generic notification bell.
+            pb.move_to(cx - size * 0.30, cy + size * 0.20);
+            pb.quad_to(cx - size * 0.22, cy + size * 0.08, cx - size * 0.22, cy - size * 0.10);
+            pb.quad_to(cx - size * 0.22, cy - size * 0.34, cx, cy - size * 0.38);
+            pb.quad_to(cx + size * 0.22, cy - size * 0.34, cx + size * 0.22, cy - size * 0.10);
+            pb.quad_to(cx + size * 0.22, cy + size * 0.08, cx + size * 0.30, cy + size * 0.20);
+            pb.move_to(cx - size * 0.36, cy + size * 0.20);
+            pb.line_to(cx + size * 0.36, cy + size * 0.20);
+            pb.push_circle(cx, cy + size * 0.31, size * 0.05);
+        }
+
+        if let Some(path) = pb.finish() {
+            if app.contains("discord") {
+                canvas.pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            } else {
+                canvas.pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
+    }
+
+    fn draw_notification_image(
+        canvas: &mut LayeredCanvas,
+        bytes: &[u8],
+        cx: f32,
+        cy: f32,
+        size: f32,
+        cover: bool,
+    ) -> bool {
+        let Ok(image) = image::load_from_memory(bytes) else {
+            return false;
+        };
+        let rgba = image.to_rgba8();
+        let Some(mut pixmap) = Pixmap::new(rgba.width(), rgba.height()) else {
+            return false;
+        };
+        for (source, target) in rgba
+            .as_raw()
+            .chunks_exact(4)
+            .zip(pixmap.data_mut().chunks_exact_mut(4))
+        {
+            let alpha = source[3] as u16;
+            target[0] = ((source[0] as u16 * alpha) / 255) as u8;
+            target[1] = ((source[1] as u16 * alpha) / 255) as u8;
+            target[2] = ((source[2] as u16 * alpha) / 255) as u8;
+            target[3] = source[3];
+        }
+
+        let image_w = pixmap.width() as f32;
+        let image_h = pixmap.height() as f32;
+        let scale = if cover {
+            (size / image_w).max(size / image_h)
+        } else {
+            (size / image_w).min(size / image_h)
+        };
+        let draw_w = image_w * scale;
+        let draw_h = image_h * scale;
+        let transform = Transform::from_scale(scale, scale).post_translate(
+            cx - draw_w / 2.0,
+            cy - draw_h / 2.0,
+        );
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.shader = Pattern::new(
+            pixmap.as_ref(),
+            SpreadMode::Pad,
+            FilterQuality::Bilinear,
+            1.0,
+            transform,
+        );
+        let mut clip = PathBuilder::new();
+        clip.push_circle(cx, cy, size / 2.0);
+        if let Some(path) = clip.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+            true
+        } else {
+            false
+        }
     }
 
     fn draw_speaker_icon(

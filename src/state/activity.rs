@@ -11,6 +11,8 @@ pub enum ActivityType {
 pub struct NotificationPayload {
     pub id: u64,
     pub app_name: String,
+    pub app_user_model_id: String,
+    pub badge_app: String,
     pub title: String,
     pub subtitle: String,
     pub time_text: String,
@@ -18,6 +20,13 @@ pub struct NotificationPayload {
     pub is_call: bool,
     pub is_device: bool,
     pub image_preview: Option<Vec<u8>>,
+    /// The notification's actual app/logo image, when Windows exposes one.
+    pub icon_image: Option<Vec<u8>>,
+    /// A toast-provided contact/avatar image. This takes precedence over the
+    /// app icon in the capsule, matching the Electron renderer.
+    pub avatar_image: Option<Vec<u8>>,
+    pub file_path: Option<String>,
+    pub has_contact_avatar: bool,
     pub brand_color: [u8; 4],
 }
 
@@ -92,6 +101,14 @@ impl ActivityManager {
     }
 
     pub fn push_notification(&mut self, notif: NotificationPayload) {
+        // The listener can report the same item more than once while the
+        // notification is being removed. Do not show or queue duplicates.
+        if self.active_notification.as_ref().map(|n| n.id) == Some(notif.id)
+            || self.notification_queue.iter().any(|n| n.id == notif.id)
+        {
+            return;
+        }
+
         if self.active_notification.is_none() {
             self.show_notification(notif);
         } else {

@@ -17,6 +17,9 @@ pub const IDM_TEST_WHATSAPP: usize = 1003;
 pub const IDM_TEST_CALL: usize = 1004;
 pub const IDM_TEST_SNIP: usize = 1005;
 pub const IDM_TEST_DISCORD: usize = 1006;
+pub const IDM_TEST_CONTROLLER: usize = 1007;
+pub const IDM_TEST_HEADPHONES: usize = 1008;
+pub const IDM_TEST_SPEAKER_DISCONNECT: usize = 1009;
 pub const IDM_QUIT: usize = 1099;
 
 pub struct TrayIcon {
@@ -70,6 +73,9 @@ impl TrayIcon {
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_CALL, w!("Test Phone Call"));
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_SNIP, w!("Test Snipping Tool"));
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_DISCORD, w!("Test Discord DM"));
+            let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_CONTROLLER, w!("Test Controller Connected"));
+            let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_HEADPHONES, w!("Test Bluetooth Earbuds Connected"));
+            let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_SPEAKER_DISCONNECT, w!("Test Bluetooth Speaker Disconnected"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT, w!("Quit Dynamic Island"));
 

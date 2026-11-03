@@ -14,7 +14,7 @@ use config::*;
 use physics::{rubber_band, ParticleSystem, Spring, SpringPreset};
 use platform::{
     AudioCaptureService, FullscreenDetector, GsmtcService, MediaControlCmd, MediaState,
-    NotificationService, VolumeManager, Win32Window,
+    DeviceService, NotificationService, VolumeManager, Win32Window,
 };
 use render::{
     build_island_path, AlbumArtManager, LayeredCanvas, MascotEngine, MascotState, ShadowRenderer,
@@ -27,7 +27,8 @@ use state::{
 };
 use ui::{
     CompactRenderer, ExpandedRenderer, TrayIcon, IDM_QUIT, IDM_TEST_CALL, IDM_TEST_DISCORD,
-    IDM_TEST_SNIP, IDM_TEST_WHATSAPP, IDM_TOGGLE_EXPAND, IDM_TUCK_AWAY, WM_TRAYICON,
+    IDM_TEST_CONTROLLER, IDM_TEST_HEADPHONES, IDM_TEST_SPEAKER_DISCONNECT, IDM_TEST_SNIP,
+    IDM_TEST_WHATSAPP, IDM_TOGGLE_EXPAND, IDM_TUCK_AWAY, WM_TRAYICON,
 };
 
 #[link(name = "winmm")]
@@ -66,6 +67,7 @@ const HTTRANSPARENT: isize = -1;
 const HTCLIENT: isize = 1;
 const WM_MOUSEACTIVATE: u32 = 0x0021;
 const MA_ACTIVATE: isize = 1;
+const WM_DEVICECHANGE: u32 = 0x0219;
 
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
@@ -80,6 +82,12 @@ unsafe extern "system" fn window_proc(
             } else {
                 windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+        }
+        WM_DEVICECHANGE => {
+            // Match Electron's native WM_DEVICECHANGE debounce path. The
+            // device worker performs the actual PnP scan off the UI thread.
+            DeviceService::request_scan();
+            windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_NCHITTEST => {
             let screen_x = (lparam.0 & 0xffff) as i16 as i32;
@@ -137,6 +145,57 @@ fn main() {
     }
 }
 
+fn open_notification_target(notif: &NotificationPayload) {
+    let identity = format!("{} {} {}", notif.app_name, notif.badge_app, notif.app_user_model_id)
+        .to_lowercase();
+
+    let target = if notif.is_snip || identity.contains("snip") || identity.contains("screensketch") {
+        let screenshots_dir = std::path::PathBuf::from(
+            std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()),
+        )
+        .join("Pictures")
+        .join("Screenshots");
+        let mut latest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        if let Ok(entries) = std::fs::read_dir(&screenshots_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_image = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg"))
+                    .unwrap_or(false);
+                if is_image {
+                    if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                        if latest.as_ref().map(|(time, _)| modified > *time).unwrap_or(true) {
+                            latest = Some((modified, path));
+                        }
+                    }
+                }
+            }
+        }
+        latest
+            .map(|(_, path)| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ms-screensketch:".to_string())
+    } else if identity.contains("yourphone")
+        || identity.contains("phone")
+        || identity.contains("whatsapp")
+        || identity.contains("instagram")
+        || notif.is_call
+    {
+        "ms-phone:".to_string()
+    } else if identity.contains("discord") {
+        "discord://".to_string()
+    } else if identity.contains("slack") {
+        "slack://".to_string()
+    } else if !notif.app_user_model_id.is_empty() {
+        format!("shell:AppsFolder\\{}", notif.app_user_model_id)
+    } else {
+        return;
+    };
+
+    let _ = std::process::Command::new("explorer.exe").arg(target).spawn();
+}
+
 fn run_app() -> windows::core::Result<()> {
     unsafe {
         let _ = timeBeginPeriod(1);
@@ -161,10 +220,23 @@ fn run_app() -> windows::core::Result<()> {
         );
     }
 
+    // Give this unpackaged desktop process a stable Windows identity. This
+    // must be set before using WinRT notification APIs so access is associated
+    // with MyIsland rather than with a generated executable ID.
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+            w!("MyIsland.DynamicIsland"),
+        );
+    }
+
     // 3. Create Win32 Borderless Alpha Window
     let window = Win32Window::create(window_proc)?;
     WIN_X.store(window.x, Ordering::Relaxed);
     WIN_Y.store(window.y, Ordering::Relaxed);
+
+    // RequestAccessAsync is documented as a UI-thread call. The notification
+    // worker only reads the already-established access status afterwards.
+    let _ = NotificationService::request_access();
 
     // 4. Create Layered Canvas for 32-bit premultiplied alpha rendering
     let mut canvas = LayeredCanvas::new(WINDOW_WIDTH, WINDOW_HEIGHT)?;
@@ -235,6 +307,12 @@ fn run_app() -> windows::core::Result<()> {
     let mut notes_cursor_pos: usize = clipboard_mgr.note_text.len();
     let mut prev_notes_cursor_pos: usize = notes_cursor_pos;
 
+    // Notification hover behavior mirrors the Electron island: expandable
+    // notifications open after a short dwell and collapse after leaving the
+    // expanded card.
+    let mut notification_hover_since: Option<Instant> = None;
+    let mut notification_leave_since: Option<Instant> = None;
+
     // Focus Timer state
     let mut focus_active = false;
     let mut focus_paused = false;
@@ -256,7 +334,8 @@ fn run_app() -> windows::core::Result<()> {
     let (art_tx, art_rx) = crossbeam_channel::unbounded::<(String, Vec<u8>)>();
 
     let gsmtc = GsmtcService::start(media_tx, window.hwnd.0 as isize)?;
-    NotificationService::start(notif_tx, window.hwnd.0 as isize);
+    NotificationService::start(notif_tx.clone(), window.hwnd.0 as isize);
+    DeviceService::start(notif_tx, window.hwnd.0 as isize);
 
     let tray = TrayIcon::create(
         window.hwnd,
@@ -370,62 +449,146 @@ fn run_app() -> windows::core::Result<()> {
                             IDM_TUCK_AWAY => {
                                 current_state = IslandState::Tucked;
                             }
-                            IDM_TEST_WHATSAPP => {
-                                activity_mgr.push_notification(NotificationPayload {
-                                    id: 101,
-                                    app_name: "WhatsApp".to_string(),
-                                    title: "Sarah".to_string(),
-                                    subtitle: "Hello messages in dynamic island!".to_string(),
-                                    time_text: "now".to_string(),
-                                    is_snip: false,
-                                    is_call: false,
-                                    is_device: false,
-                                    image_preview: None,
-                                    brand_color: [37, 211, 102, 255],
-                                });
-                            }
-                            IDM_TEST_CALL => {
-                                activity_mgr.push_notification(NotificationPayload {
-                                    id: 102,
-                                    app_name: "Calls".to_string(),
-                                    title: "Me Jio".to_string(),
-                                    subtitle: "Incoming Call • Phone Link".to_string(),
-                                    time_text: "now".to_string(),
-                                    is_snip: false,
-                                    is_call: true,
-                                    is_device: false,
-                                    image_preview: None,
-                                    brand_color: [48, 209, 88, 255],
-                                });
-                            }
-                            IDM_TEST_SNIP => {
-                                activity_mgr.push_notification(NotificationPayload {
-                                    id: 103,
-                                    app_name: "Snipping Tool".to_string(),
-                                    title: "Snipping Tool".to_string(),
-                                    subtitle: "Screenshot saved to clipboard".to_string(),
-                                    time_text: "now".to_string(),
-                                    is_snip: true,
-                                    is_call: false,
-                                    is_device: false,
-                                    image_preview: None,
-                                    brand_color: [100, 210, 255, 255],
-                                });
-                            }
-                            IDM_TEST_DISCORD => {
-                                activity_mgr.push_notification(NotificationPayload {
-                                    id: 104,
-                                    app_name: "Discord".to_string(),
-                                    title: "biwi ji".to_string(),
-                                    subtitle: "Its like youre screaming at meeee".to_string(),
-                                    time_text: "now".to_string(),
-                                    is_snip: false,
-                                    is_call: false,
-                                    is_device: false,
-                                    image_preview: None,
-                                    brand_color: [88, 101, 242, 255],
-                                });
-                            }
+                             IDM_TEST_WHATSAPP => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 101,
+                                     app_name: "WhatsApp".to_string(),
+                                     app_user_model_id: "Microsoft.YourPhone".to_string(),
+                                     badge_app: "whatsapp".to_string(),
+                                     title: "Sarah".to_string(),
+                                     subtitle: "Hello messages in dynamic island!".to_string(),
+                                     time_text: "now".to_string(),
+                                     is_snip: false,
+                                      is_call: false,
+                                      is_device: false,
+                                      image_preview: None,
+                                      icon_image: None,
+                                      avatar_image: None,
+                                      file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [37, 211, 102, 255],
+                                 });
+                             }
+                             IDM_TEST_CALL => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 102,
+                                     app_name: "Calls".to_string(),
+                                     app_user_model_id: "Microsoft.YourPhone".to_string(),
+                                     badge_app: "phone".to_string(),
+                                     title: "Me Jio".to_string(),
+                                     subtitle: "Incoming Call • Phone Link".to_string(),
+                                     time_text: "now".to_string(),
+                                     is_snip: false,
+                                      is_call: true,
+                                      is_device: false,
+                                      image_preview: None,
+                                      icon_image: None,
+                                      avatar_image: None,
+                                      file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [48, 209, 88, 255],
+                                 });
+                             }
+                             IDM_TEST_SNIP => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 103,
+                                     app_name: "Snipping Tool".to_string(),
+                                     app_user_model_id: "Microsoft.ScreenSketch".to_string(),
+                                     badge_app: "snipping".to_string(),
+                                     title: "Snipping Tool".to_string(),
+                                     subtitle: "Screenshot saved to clipboard".to_string(),
+                                     time_text: "now".to_string(),
+                                     is_snip: true,
+                                      is_call: false,
+                                      is_device: false,
+                                      image_preview: None,
+                                      icon_image: None,
+                                      avatar_image: None,
+                                      file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [100, 210, 255, 255],
+                                 });
+                             }
+                             IDM_TEST_DISCORD => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 104,
+                                     app_name: "Discord".to_string(),
+                                     app_user_model_id: "discord".to_string(),
+                                     badge_app: "discord".to_string(),
+                                     title: "biwi ji".to_string(),
+                                     subtitle: "Its like youre screaming at meeee".to_string(),
+                                     time_text: "now".to_string(),
+                                     is_snip: false,
+                                      is_call: false,
+                                      is_device: false,
+                                      image_preview: None,
+                                      icon_image: None,
+                                      avatar_image: None,
+                                      file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [88, 101, 242, 255],
+                                 });
+                             }
+                             IDM_TEST_CONTROLLER => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 107,
+                                     app_name: "Xbox Wireless Controller".to_string(),
+                                     app_user_model_id: String::new(),
+                                     badge_app: "controller".to_string(),
+                                     title: "Xbox Wireless Controller".to_string(),
+                                     subtitle: "Connected".to_string(),
+                                     time_text: String::new(),
+                                     is_snip: false,
+                                     is_call: false,
+                                     is_device: true,
+                                     image_preview: None,
+                                     icon_image: None,
+                                     avatar_image: None,
+                                     file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [48, 209, 88, 255],
+                                 });
+                             }
+                             IDM_TEST_HEADPHONES => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 108,
+                                     app_name: "Bluetooth Earbuds".to_string(),
+                                     app_user_model_id: String::new(),
+                                     badge_app: "headphone".to_string(),
+                                     title: "Bluetooth Earbuds".to_string(),
+                                     subtitle: "Connected".to_string(),
+                                     time_text: String::new(),
+                                     is_snip: false,
+                                     is_call: false,
+                                     is_device: true,
+                                     image_preview: None,
+                                     icon_image: None,
+                                     avatar_image: None,
+                                     file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [48, 209, 88, 255],
+                                 });
+                             }
+                             IDM_TEST_SPEAKER_DISCONNECT => {
+                                 activity_mgr.push_notification(NotificationPayload {
+                                     id: 109,
+                                     app_name: "Bluetooth Speaker".to_string(),
+                                     app_user_model_id: String::new(),
+                                     badge_app: "speaker".to_string(),
+                                     title: "Bluetooth Speaker".to_string(),
+                                     subtitle: "Disconnected".to_string(),
+                                     time_text: String::new(),
+                                     is_snip: false,
+                                     is_call: false,
+                                     is_device: true,
+                                     image_preview: None,
+                                     icon_image: None,
+                                     avatar_image: None,
+                                     file_path: None,
+                                     has_contact_avatar: false,
+                                     brand_color: [255, 69, 58, 255],
+                                 });
+                             }
                             IDM_QUIT => {
                                 SHOULD_QUIT.store(true, Ordering::SeqCst);
                             }
@@ -568,7 +731,17 @@ fn run_app() -> windows::core::Result<()> {
                             let is_suppressed = suppress_expand_until.map_or(false, |until| Instant::now() < until);
                             if !is_suppressed {
                                 if activity_mgr.active_notification.is_some() {
+                                    let dismiss_hit = px >= island_x_cur + w_cur - 42.0
+                                        && px <= island_x_cur + w_cur - 8.0
+                                        && py >= 5.0
+                                        && py <= spring_h.value + 5.0;
+                                    if !dismiss_hit {
+                                        if let Some(notif) = activity_mgr.active_notification.as_ref() {
+                                            open_notification_target(notif);
+                                        }
+                                    }
                                     activity_mgr.dismiss_notification();
+                                    is_dirty = true;
                                 } else {
                                     let (primary_act, sec_act) = activity_mgr.get_activities();
                                     let sec_w = sec_spring_w.value;
@@ -619,7 +792,40 @@ fn run_app() -> windows::core::Result<()> {
                             let is_outside_card = px < exp_x || px > exp_x + DIMS_EXPANDED.w || py > DIMS_EXPANDED.h;
                             let can_collapse_outside = is_outside_card && spring_w.value >= DIMS_EXPANDED.w - 40.0;
 
-                            if px >= island_x_cur + w_cur - 38.0
+                            if activity_mgr.is_notification_expanded
+                                && activity_mgr.active_notification.is_some()
+                            {
+                                let close_hit = px >= island_x_cur + w_cur - 42.0
+                                    && px <= island_x_cur + w_cur - 12.0
+                                    && py >= 4.0
+                                    && py <= 38.0;
+                                if close_hit {
+                                    activity_mgr.dismiss_notification();
+                                    current_state = IslandState::Compact;
+                                } else if is_outside_card {
+                                    activity_mgr.is_notification_expanded = false;
+                                    current_state = IslandState::Compact;
+                                } else if let Some(notif) = activity_mgr.active_notification.as_ref() {
+                                    let body_y = 54.0;
+                                    let left = island_x_cur + 22.0;
+                                    let action_x = left + 176.0;
+                                    let action_w = w_cur - 44.0 - 176.0;
+                                    let action_hit = notif.is_snip
+                                        && px >= action_x
+                                        && px <= action_x + action_w
+                                        && ((py >= body_y + 10.0 && py <= body_y + 48.0)
+                                            || (py >= body_y + 56.0 && py <= body_y + 94.0));
+                                    let call_hit = notif.is_call
+                                        && py >= body_y + 55.0
+                                        && py <= body_y + 97.0;
+                                    if action_hit || call_hit {
+                                        open_notification_target(notif);
+                                        activity_mgr.dismiss_notification();
+                                        current_state = IslandState::Compact;
+                                    }
+                                }
+                                is_dirty = true;
+                            } else if px >= island_x_cur + w_cur - 38.0
                                 && px <= island_x_cur + w_cur - 16.0
                                 && py >= 9.0
                                 && py <= 31.0
@@ -972,9 +1178,17 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
-        while let Ok(notif) = notif_rx.try_recv() {
+        while let Ok(mut notif) = notif_rx.try_recv() {
             is_dirty = true;
+            if notif.is_snip && notif.image_preview.is_none() {
+                notif.image_preview = ClipboardManager::read_clipboard_image_png();
+            }
             activity_mgr.push_notification(notif);
+            // A new notification takes over the compact island unless the
+            // user is already in an expanded card or tucked mode.
+            if current_state != IslandState::Expanded && current_state != IslandState::Tucked {
+                current_state = IslandState::Compact;
+            }
         }
 
         while let Ok((key, lines)) = lyrics_rx.try_recv() {
@@ -1078,6 +1292,56 @@ fn run_app() -> windows::core::Result<()> {
             over_primary || over_sec
         };
 
+        // Notification hover dwell: Snipping Tool and call notifications have
+        // an expanded card in the original UI. Ordinary app notifications
+        // remain a compact banner and open their source on click.
+        let notification_expandable = activity_mgr
+            .active_notification
+            .as_ref()
+            .map(|n| n.is_snip || n.is_call)
+            .unwrap_or(false);
+
+        if activity_mgr.active_notification.is_some()
+            && notification_expandable
+            && current_state == IslandState::Compact
+        {
+            if is_over_main {
+                notification_leave_since = None;
+                if notification_hover_since.is_none() {
+                    notification_hover_since = Some(now);
+                } else if now
+                    .duration_since(notification_hover_since.unwrap())
+                    .as_millis()
+                    >= 250
+                {
+                    activity_mgr.is_notification_expanded = true;
+                    current_state = IslandState::Expanded;
+                    notification_hover_since = None;
+                    is_dirty = true;
+                }
+            } else {
+                notification_hover_since = None;
+            }
+        } else if activity_mgr.is_notification_expanded && current_state == IslandState::Expanded {
+            if is_over_main {
+                notification_leave_since = None;
+            } else if notification_leave_since.is_none() {
+                notification_leave_since = Some(now);
+            } else if now
+                .duration_since(notification_leave_since.unwrap())
+                .as_millis()
+                >= 600
+            {
+                activity_mgr.is_notification_expanded = false;
+                current_state = IslandState::Compact;
+                notification_leave_since = None;
+                is_dirty = true;
+            }
+        } else {
+            notification_hover_since = None;
+            notification_leave_since = None;
+        }
+
         // Cursor anticipation: within a small ring around the pill (before hover
         // actually triggers) the membrane leans toward the pointer by up to 3px.
         let near_main = if current_state == IslandState::Expanded {
@@ -1121,7 +1385,7 @@ fn run_app() -> windows::core::Result<()> {
             } else {
                 leave_timer_start = None;
             }
-        } else if current_state == IslandState::Expanded {
+        } else if current_state == IslandState::Expanded && !activity_mgr.is_notification_expanded {
             if !is_over_main {
                 if let Some(start) = expanded_leave_timer {
                     if now.duration_since(start).as_millis() >= 220 {
@@ -1214,6 +1478,26 @@ fn run_app() -> windows::core::Result<()> {
             IslandState::Expanded => DIMS_EXPANDED,
             IslandState::Tucked => DIMS_TUCKED,
         };
+
+        // Authentic notification banner proportions from the Electron
+        // implementation: 530x58 in compact mode, with type-specific card
+        // sizes after a hover dwell.
+        if let Some(notif) = activity_mgr.active_notification.as_ref() {
+            if current_state != IslandState::Tucked
+                && (current_state != IslandState::Expanded
+                    || activity_mgr.is_notification_expanded)
+            {
+                target_dims = if activity_mgr.is_notification_expanded {
+                    if notif.is_call {
+                        IslandDims { w: 480.0, h: 155.0, r: 28.0 }
+                    } else {
+                        IslandDims { w: 520.0, h: 180.0, r: 28.0 }
+                    }
+                } else {
+                    IslandDims { w: 530.0, h: 58.0, r: 29.0 }
+                };
+            }
+        }
 
         // Active press bounce: compress the membrane while the button is held.
         if press_active {
@@ -1622,35 +1906,51 @@ fn run_app() -> windows::core::Result<()> {
         };
 
         if current_state == IslandState::Expanded {
-            let anim = ExpandedRenderer::render(
-                &mut canvas,
-                &mut mascot,
-                &album_art_mgr,
-                island_x,
-                w_val,
-                h_val,
-                content_entrance,
-                current_app,
-                scroll_wheel_progress,
-                pointer_x,
-                pointer_y,
-                &render_media,
-                &lyrics,
-                &clipboard_mgr,
-                focus_active,
-                focus_paused,
-                focus_left_ms,
-                focus_total_ms,
-                focus_chosen_sec,
-                ruler_visual_mins,
-                notes_focused,
-                notes_cursor_pos,
-                cursor_moved,
-                clip_copied_index,
-                clip_scroll_progress,
-                &mut target_notes_scroll,
-                notes_scroll_progress,
-            );
+            let anim = if activity_mgr.is_notification_expanded {
+                if let Some(notif) = activity_mgr.active_notification.as_ref() {
+                    ExpandedRenderer::render_notification(
+                        &mut canvas,
+                        notif,
+                        island_x,
+                        w_val,
+                        h_val,
+                        pointer_x,
+                        pointer_y,
+                    )
+                } else {
+                    false
+                }
+            } else {
+                ExpandedRenderer::render(
+                    &mut canvas,
+                    &mut mascot,
+                    &album_art_mgr,
+                    island_x,
+                    w_val,
+                    h_val,
+                    content_entrance,
+                    current_app,
+                    scroll_wheel_progress,
+                    pointer_x,
+                    pointer_y,
+                    &render_media,
+                    &lyrics,
+                    &clipboard_mgr,
+                    focus_active,
+                    focus_paused,
+                    focus_left_ms,
+                    focus_total_ms,
+                    focus_chosen_sec,
+                    ruler_visual_mins,
+                    notes_focused,
+                    notes_cursor_pos,
+                    cursor_moved,
+                    clip_copied_index,
+                    clip_scroll_progress,
+                    &mut target_notes_scroll,
+                    notes_scroll_progress,
+                )
+            };
             if anim {
                 ui_animating = true;
             }
