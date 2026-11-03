@@ -107,7 +107,7 @@ impl Spring {
         let steps = ((clamped_dt / (1.0 / 240.0)).ceil() as usize).max(1).min(8);
         let h = clamped_dt / (steps as f32);
 
-        let (k, d) = if self.asymmetric {
+        let (base_k, base_d) = if self.asymmetric {
             if self.target >= self.value {
                 // Expanding / growing: juicy rubber bounce (~15% overshoot).
                 (220.0, 17.2)
@@ -119,8 +119,19 @@ impl Spring {
             (self.stiffness, self.damping)
         };
 
+        // Direction-aware damping: approaching the target stays lively, while
+        // motion away from it (overshoot) meets slightly more resistance so it
+        // settles with fewer stale ripples.
+        let error = self.target - self.value;
+        let moving_away = error * self.velocity < 0.0;
+        let d = if moving_away {
+            base_d * 1.08
+        } else {
+            base_d * 0.98
+        };
+
         for _ in 0..steps {
-            let force = -k * (self.value - self.target);
+            let force = -base_k * (self.value - self.target);
             let damp = -d * self.velocity;
             let accel = force + damp;
             self.velocity += accel * h;
@@ -145,5 +156,21 @@ impl Spring {
         } else {
             true
         }
+    }
+}
+
+/// Progressive resistance past a soft boundary. Used for the focus ruler so
+/// dragging past its 1–60 minute range feels elastic instead of hitting a hard
+/// wall. The overflow asymptotically approaches `1 / resistance` units.
+pub fn rubber_band(value: f32, min: f32, max: f32, resistance: f32) -> f32 {
+    let resistance = resistance.max(0.01);
+    if value < min {
+        let overflow = min - value;
+        min - overflow * resistance / (1.0 + overflow * resistance * 0.35)
+    } else if value > max {
+        let overflow = value - max;
+        max + overflow * resistance / (1.0 + overflow * resistance * 0.35)
+    } else {
+        value
     }
 }

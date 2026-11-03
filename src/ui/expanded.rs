@@ -28,6 +28,7 @@ impl ExpandedRenderer {
         focus_left_ms: u64,
         focus_total_ms: u64,
         focus_chosen_sec: u64,
+        ruler_visual_mins: f32,
         notes_focused: bool,
         notes_cursor_pos: usize,
         cursor_moved: bool,
@@ -129,7 +130,7 @@ impl ExpandedRenderer {
             canvas.pixmap.stroke_path(&p, &div_paint, &stroke_1, Transform::identity(), None);
         }
 
-        // 5. Active App Panel (rolls in with a subtle parallax offset)
+        // 5. Active App Panel
         let body_x = island_x + 22.0;
         let body_y = 44.0 + 9.0 * (1.0 - e_text);
         let body_w = w - 44.0;
@@ -150,6 +151,7 @@ impl ExpandedRenderer {
                 focus_left_ms,
                 focus_total_ms,
                 focus_chosen_sec,
+                ruler_visual_mins,
             ),
             _ => {}
         }
@@ -866,6 +868,7 @@ impl ExpandedRenderer {
         left_ms: u64,
         total_ms: u64,
         chosen_sec: u64,
+        visual_mins: f32,
     ) {
         let orange = Color::from_rgba8(240, 160, 100, 255);
 
@@ -874,6 +877,8 @@ impl ExpandedRenderer {
             let total_minutes = 60;
             let tick_width = 10.0f32;
             let current_mins = ((chosen_sec as f32 / 60.0).round() as i32).clamp(1, total_minutes);
+            let visual_mins = visual_mins.clamp(-1.0, total_minutes as f32 + 1.0);
+            let selected_mins = (visual_mins.round() as i32).clamp(1, total_minutes);
 
             let ruler_x = x + 6.0;
             let ruler_y = y + 2.0;
@@ -881,8 +886,10 @@ impl ExpandedRenderer {
             let ruler_h = 50.0;
             let center_x = ruler_x + ruler_w / 2.0;
 
-            // Track target translation: centers selected tick under cursor
-            let track_x = center_x - (current_mins as f32 * tick_width);
+            // Track target translation: centers selected tick under cursor.
+            // The fractional value lets the ruler elastically overscroll at its
+            // 1–60 minute limits before springing back.
+            let track_x = center_x - (visual_mins * tick_width);
 
             // Draw ticks (0 to 60 minutes)
             for m in 0..=total_minutes {
@@ -901,7 +908,7 @@ impl ExpandedRenderer {
                 }
 
                 let is_major = m % 5 == 0;
-                let is_selected = m == current_mins;
+                let is_selected = m == selected_mins;
 
                 if is_selected {
                     // Selected tick: glowing bold amber bar (MyIsland line 138: 3.2px wide, 28px tall, margin-top 8px)

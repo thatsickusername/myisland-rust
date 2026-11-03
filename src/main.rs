@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 use config::*;
-use physics::{ParticleSystem, Spring, SpringPreset};
+use physics::{rubber_band, ParticleSystem, Spring, SpringPreset};
 use platform::{
     AudioCaptureService, FullscreenDetector, GsmtcService, MediaControlCmd, MediaState,
     NotificationService, VolumeManager, Win32Window,
@@ -185,6 +185,11 @@ fn run_app() -> windows::core::Result<()> {
     let mut content_scale_spring = Spring::from_preset(1.0, SpringPreset::FluidExpansion);
     content_scale_spring.target = 1.0;
     let mut volume_stretch_spring = Spring::new(0.0, 300.0, 20.0);
+    // Cursor anticipation: a tiny pre-lift as the pointer approaches the pill.
+    let mut anticipation_spring = Spring::new(0.0, 190.0, 24.0);
+    // Fractional ruler position so the focus ruler can overscroll elastically.
+    let mut ruler_spring = Spring::new(15.0, 300.0, 26.0);
+    ruler_spring.target = 15.0;
     let mut press_active = false;
     let mut expanded_since: Option<Instant> = None;
     let mut impulse_state = IslandState::Rest;
@@ -269,6 +274,9 @@ fn run_app() -> windows::core::Result<()> {
     let mut prev_pointer_x: f32 = -9999.0;
     let mut prev_pointer_y: f32 = -9999.0;
     let mut last_cursor_move_time = Instant::now();
+    let mut prev_pointer_sample_time = Instant::now();
+    let mut pointer_vel_x: f32 = 0.0;
+    let mut pointer_vel_y: f32 = 0.0;
     let mut prev_state = current_state;
 
     // 8. Main Message Pump & Zero-Idle Render Gating Loop
@@ -498,6 +506,11 @@ fn run_app() -> windows::core::Result<()> {
                                 is_dragging_ruler = true;
                                 ruler_drag_start_x = px;
                                 ruler_drag_start_mins = ((focus_chosen_sec as f32 / 60.0).round() as i32).clamp(1, 60);
+                                // Hand the spring the current visual position so
+                                // grabbing the ruler never produces a jump.
+                                ruler_spring.value = ruler_drag_start_mins as f32;
+                                ruler_spring.target = ruler_spring.value;
+                                ruler_spring.velocity = 0.0;
                                 windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(window.hwnd);
                             }
                         }
@@ -518,8 +531,11 @@ fn run_app() -> windows::core::Result<()> {
                         if is_dragging_ruler {
                             let (px, _, _) = window.get_cursor_relative();
                             let delta_x = px - ruler_drag_start_x;
-                            let delta_mins = -(delta_x / 10.0).round() as i32;
-                            let new_mins = (ruler_drag_start_mins + delta_mins).clamp(1, 60);
+                            let raw_mins = ruler_drag_start_mins as f32 - delta_x / 10.0;
+                            // Progressive resistance past 1–60 minutes: the ruler
+                            // stretches instead of stopping dead, then springs back.
+                            ruler_spring.target = rubber_band(raw_mins, 1.0, 60.0, 0.40);
+                            let new_mins = (raw_mins.round() as i32).clamp(1, 60);
                             if (new_mins as u64 * 60) != focus_chosen_sec {
                                 focus_chosen_sec = new_mins as u64 * 60;
                                 is_dirty = true;
@@ -529,6 +545,8 @@ fn run_app() -> windows::core::Result<()> {
                     WM_LBUTTONUP => {
                         if is_dragging_ruler {
                             is_dragging_ruler = false;
+                            // Snap the elastic overscroll back to the chosen tick.
+                            ruler_spring.target = (focus_chosen_sec as f32 / 60.0).clamp(1.0, 60.0);
                             let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                             is_dirty = true;
                         }
@@ -1009,12 +1027,30 @@ fn run_app() -> windows::core::Result<()> {
 
         // Track Pointer & Proximity
         let (pointer_x, pointer_y, _inside_window) = window.get_cursor_relative();
+        let sample_now = Instant::now();
         if (pointer_x - prev_pointer_x).abs() > 0.5 || (pointer_y - prev_pointer_y).abs() > 0.5 {
+            // Pointer velocity in px/s, exponentially smoothed. Guard the first
+            // sample (prev sentinel) and long stalls so velocity never spikes.
+            if prev_pointer_x > -9000.0 {
+                let sample_dt = sample_now
+                    .duration_since(prev_pointer_sample_time)
+                    .as_secs_f32()
+                    .clamp(0.001, 0.12);
+                let inst_vx = (pointer_x - prev_pointer_x) / sample_dt;
+                let inst_vy = (pointer_y - prev_pointer_y) / sample_dt;
+                pointer_vel_x = pointer_vel_x * 0.55 + inst_vx * 0.45;
+                pointer_vel_y = pointer_vel_y * 0.55 + inst_vy * 0.45;
+            }
             prev_pointer_x = pointer_x;
             prev_pointer_y = pointer_y;
-            last_cursor_move_time = Instant::now();
+            prev_pointer_sample_time = sample_now;
+            last_cursor_move_time = sample_now;
             mascot.notify_activity();
             is_dirty = true;
+        } else {
+            // Fade out stale momentum while the pointer rests.
+            pointer_vel_x *= 0.82;
+            pointer_vel_y *= 0.82;
         }
         let now = Instant::now();
 
@@ -1041,6 +1077,18 @@ fn run_app() -> windows::core::Result<()> {
                 && pointer_y <= sec_spring_h.value + 8.0;
             over_primary || over_sec
         };
+
+        // Cursor anticipation: within a small ring around the pill (before hover
+        // actually triggers) the membrane leans toward the pointer by up to 3px.
+        let near_main = if current_state == IslandState::Expanded {
+            false
+        } else {
+            pointer_x >= island_x - 30.0
+                && pointer_x <= island_x + w_val + 30.0
+                && pointer_y >= -10.0
+                && pointer_y <= h_val + 30.0
+        };
+        anticipation_spring.target = if near_main && !is_over_main { 3.0 } else { 0.0 };
 
         // Update atomic bounds for native WM_NCHITTEST
         HIT_X.store(island_x as i32, Ordering::Relaxed);
@@ -1101,21 +1149,24 @@ fn run_app() -> windows::core::Result<()> {
         }
 
         // Kinetic momentum on state changes: immediate tactile takeoff instead
-        // of a sluggish zero-velocity ramp.
+        // of a sluggish zero-velocity ramp. Growth transitions hand the pointer's
+        // live velocity to the spring so the membrane continues the gesture.
         if current_state != impulse_state {
+            let pvx = pointer_vel_x.clamp(-600.0, 600.0);
+            let pvy = pointer_vel_y.clamp(-450.0, 450.0);
             match (impulse_state, current_state) {
                 (IslandState::Rest, IslandState::Compact) => {
-                    spring_w.impulse(120.0);
+                    spring_w.impulse((120.0 + pvx * 0.10).clamp(40.0, 280.0));
                 }
                 (IslandState::Compact, IslandState::Rest) => {
                     spring_w.impulse(-140.0);
                 }
                 (IslandState::Tucked, IslandState::Compact) => {
-                    spring_w.impulse(100.0);
+                    spring_w.impulse((100.0 + pvx * 0.08).clamp(40.0, 240.0));
                 }
                 (_, IslandState::Expanded) => {
-                    spring_h.impulse(180.0);
-                    spring_w.impulse(200.0);
+                    spring_h.impulse((180.0 + pvy * 0.16).clamp(80.0, 340.0));
+                    spring_w.impulse((200.0 + pvx * 0.12).clamp(90.0, 360.0));
                 }
                 (IslandState::Expanded, IslandState::Compact)
                 | (IslandState::Expanded, IslandState::Rest) => {
@@ -1171,9 +1222,17 @@ fn run_app() -> windows::core::Result<()> {
             target_dims.r *= 0.96;
         }
 
+        // Anticipation lean: a gentle pre-lift, never a real state change.
+        target_dims.w += anticipation_spring.value * 0.55;
+        target_dims.h += anticipation_spring.value;
+
         spring_w.target = target_dims.w;
         spring_h.target = target_dims.h;
         spring_r.target = target_dims.r;
+
+        if !is_dragging_ruler {
+            ruler_spring.target = (focus_chosen_sec as f32 / 60.0).clamp(1.0, 60.0);
+        }
 
         // Secondary bubble target
         let (primary_act, sec_act) = activity_mgr.get_activities();
@@ -1213,9 +1272,11 @@ fn run_app() -> windows::core::Result<()> {
         let s9 = content_scale_spring.update(dt);
         volume_stretch_spring.target = 0.0;
         let s10 = volume_stretch_spring.update(dt);
+        let s11 = anticipation_spring.update(dt);
+        let s12 = ruler_spring.update(dt);
 
         let has_secondary = sec_act.is_some() || sec_spring_w.value > 0.5;
-        let springs_moving = s1 || s2 || s3 || s8 || s9 || s10
+        let springs_moving = s1 || s2 || s3 || s8 || s9 || s10 || s11 || s12
             || (has_secondary && (s4 || s5 || s6 || s7))
             || (spring_w.value - spring_w.target).abs() > 0.15
             || (spring_h.value - spring_h.target).abs() > 0.15
@@ -1554,6 +1615,12 @@ fn run_app() -> windows::core::Result<()> {
         // Render Active Mode Content with true overflow:hidden squircle clipping
         canvas.begin_island_content();
 
+        let ruler_visual_mins = if current_app == 3 {
+            ruler_spring.value
+        } else {
+            (focus_chosen_sec as f32 / 60.0).clamp(1.0, 60.0)
+        };
+
         if current_state == IslandState::Expanded {
             let anim = ExpandedRenderer::render(
                 &mut canvas,
@@ -1575,6 +1642,7 @@ fn run_app() -> windows::core::Result<()> {
                 focus_left_ms,
                 focus_total_ms,
                 focus_chosen_sec,
+                ruler_visual_mins,
                 notes_focused,
                 notes_cursor_pos,
                 cursor_moved,
