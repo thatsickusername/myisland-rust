@@ -17,8 +17,8 @@ use platform::{
     NotificationService, VolumeManager, Win32Window,
 };
 use render::{
-    build_island_path, build_liquid_bridge_path, AlbumArtManager, LayeredCanvas, MascotEngine,
-    MascotState, ShadowRenderer, Visualizer, LIQUID_BRIDGE_MAX_GAP,
+    build_island_path, AlbumArtManager, LayeredCanvas, MascotEngine, MascotState, ShadowRenderer,
+    Visualizer,
 };
 use tiny_skia::{PathBuilder, Transform};
 use state::{
@@ -185,12 +185,9 @@ fn run_app() -> windows::core::Result<()> {
     let mut content_scale_spring = Spring::from_preset(1.0, SpringPreset::FluidExpansion);
     content_scale_spring.target = 1.0;
     let mut volume_stretch_spring = Spring::new(0.0, 300.0, 20.0);
-    let mut sec_wobble_w = Spring::from_preset(0.0, SpringPreset::DropletWobble);
-    let mut sec_wobble_x = Spring::from_preset(0.0, SpringPreset::DropletWobble);
     let mut press_active = false;
     let mut expanded_since: Option<Instant> = None;
     let mut impulse_state = IslandState::Rest;
-    let mut was_bridge_attached = false;
 
     // 6. State Managers & Engines
     let mut current_state = IslandState::Rest;
@@ -1080,8 +1077,16 @@ fn run_app() -> windows::core::Result<()> {
             if !is_over_main {
                 if let Some(start) = expanded_leave_timer {
                     if now.duration_since(start).as_millis() >= 220 {
-                        current_state = IslandState::Compact;
                         expanded_leave_timer = None;
+                        leave_timer_start = None;
+                        // No active content: collapse straight to idle instead of
+                        // passing through a brief Compact state. With an activity
+                        // present, return to the activity pill as before.
+                        current_state = if has_active_content {
+                            IslandState::Compact
+                        } else {
+                            IslandState::Rest
+                        };
                     }
                 } else {
                     expanded_leave_timer = Some(now);
@@ -1112,7 +1117,8 @@ fn run_app() -> windows::core::Result<()> {
                     spring_h.impulse(180.0);
                     spring_w.impulse(200.0);
                 }
-                (IslandState::Expanded, IslandState::Compact) => {
+                (IslandState::Expanded, IslandState::Compact)
+                | (IslandState::Expanded, IslandState::Rest) => {
                     spring_h.impulse(-220.0);
                     spring_w.impulse(-160.0);
                 }
@@ -1208,24 +1214,9 @@ fn run_app() -> windows::core::Result<()> {
         volume_stretch_spring.target = 0.0;
         let s10 = volume_stretch_spring.update(dt);
 
-        // Liquid-bridge detachment: when the neck snaps, ring the secondary pill
-        // with a short high-frequency droplet wobble.
-        let live_island_x = ((WINDOW_WIDTH as f32) - spring_w.value) / 2.0;
-        let live_gap = sec_spring_x.value - (live_island_x + spring_w.value);
-        let bridge_attached = sec_spring_w.value > 1.5
-            && live_gap > -2.0
-            && live_gap < LIQUID_BRIDGE_MAX_GAP;
-        if was_bridge_attached && !bridge_attached && sec_spring_w.value > 1.5 {
-            sec_wobble_w.impulse(-42.0);
-            sec_wobble_x.impulse(28.0);
-        }
-        was_bridge_attached = bridge_attached;
-        let s11 = sec_wobble_w.update(dt);
-        let s12 = sec_wobble_x.update(dt);
-
         let has_secondary = sec_act.is_some() || sec_spring_w.value > 0.5;
         let springs_moving = s1 || s2 || s3 || s8 || s9 || s10
-            || (has_secondary && (s4 || s5 || s6 || s7 || s11 || s12))
+            || (has_secondary && (s4 || s5 || s6 || s7))
             || (spring_w.value - spring_w.target).abs() > 0.15
             || (spring_h.value - spring_h.target).abs() > 0.15
             || (spring_r.value - spring_r.target).abs() > 0.15
@@ -1417,10 +1408,10 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
-        // Secondary Pill (Dual Activity) — with detachment wobble
-        let sec_w = (sec_spring_w.value + sec_wobble_w.value).max(1.5);
+        // Secondary Pill (Dual Activity)
+        let sec_w = sec_spring_w.value.max(1.5);
         let sec_h = sec_spring_h.value;
-        let sec_x = sec_spring_x.value + sec_wobble_x.value;
+        let sec_x = sec_spring_x.value;
 
         if current_state == IslandState::Compact && sec_w > 1.5 && sec_h > 1.5 {
             SEC_HIT_X.store(sec_x as i32, Ordering::Relaxed);
@@ -1444,16 +1435,6 @@ fn run_app() -> windows::core::Result<()> {
                 true,
                 springs_moving,
             );
-
-            let gap = sec_x - (island_x + w_val);
-
-            // Organic Liquid Bridge
-            if let Some(bridge) = build_liquid_bridge_path(island_x, w_val, sec_x, h_val, sec_h, gap) {
-                let mut bridge_paint = tiny_skia::Paint::default();
-                bridge_paint.anti_alias = true;
-                bridge_paint.set_color_rgba8(0, 0, 0, 255);
-                canvas.pixmap.fill_path(&bridge, &bridge_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-            }
 
             // Secondary Body
             if let Some(sec_path) = build_island_path(sec_x, 0.0, sec_w, sec_h, sec_spring_r.value) {

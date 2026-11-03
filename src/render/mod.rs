@@ -5,7 +5,7 @@ pub mod canvas;
 pub mod shadow;
 pub mod album_art;
 
-pub use curves::{build_island_path, build_liquid_bridge_path, LIQUID_BRIDGE_MAX_GAP};
+pub use curves::build_island_path;
 pub use mascot::{MascotEngine, MascotState};
 pub use visualizer::Visualizer;
 pub use canvas::LayeredCanvas;
