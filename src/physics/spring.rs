@@ -1,3 +1,34 @@
+/// Named physics profiles tuned for Apple-style Dynamic Island fluidity.
+/// Stiffness (k) is expressed in px/s² per px of displacement and damping (c)
+/// in 1/s. Lower damping ratios (ζ ≈ c / (2√k)) produce elastic overshoot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SpringPreset {
+    /// Juicy rubber expansion: ζ ≈ 0.57, ~15% overshoot.
+    FluidExpansion,
+    /// Crisp snap-back recoil: ζ ≈ 0.69, single micro-oscillation.
+    FluidRecoil,
+    /// Volume HUD slider: quick but controlled.
+    VolumeSlider,
+    /// High-frequency organic jelly wobble for detached droplets.
+    DropletWobble,
+    /// Arbitrary stiffness/damping supplied by the caller.
+    Custom,
+}
+
+impl SpringPreset {
+    /// Returns `(stiffness, damping)` for the preset.
+    pub fn params(self) -> (f32, f32) {
+        match self {
+            SpringPreset::FluidExpansion => (220.0, 17.0),
+            SpringPreset::FluidRecoil => (260.0, 21.0),
+            SpringPreset::VolumeSlider => (250.0, 22.0),
+            SpringPreset::DropletWobble => (310.0, 15.0),
+            SpringPreset::Custom => (230.0, 24.5),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Spring {
     pub value: f32,
@@ -6,6 +37,7 @@ pub struct Spring {
     pub stiffness: f32,
     pub damping: f32,
     pub asymmetric: bool,
+    pub preset: SpringPreset,
 }
 
 impl Spring {
@@ -18,31 +50,54 @@ impl Spring {
             stiffness,
             damping,
             asymmetric: false,
+            preset: SpringPreset::Custom,
+        }
+    }
+
+    /// Build a spring from a named physics profile.
+    #[allow(dead_code)]
+    pub fn from_preset(val: f32, preset: SpringPreset) -> Self {
+        let (stiffness, damping) = preset.params();
+        Self {
+            value: val,
+            target: val,
+            velocity: 0.0,
+            stiffness,
+            damping,
+            asymmetric: false,
+            preset,
         }
     }
 
     /// Default island spring with Apple Dynamic Island asymmetric physics:
-    /// bouncy, crisp 3% overshoot on expansion, snappy snap-back on collapse.
+    /// elastic, rubbery expansion (~15% overshoot) and a crisp snap-back recoil.
     pub fn default_island(val: f32) -> Self {
+        let (stiffness, damping) = SpringPreset::FluidExpansion.params();
         Self {
             value: val,
             target: val,
             velocity: 0.0,
-            stiffness: 230.0,
-            damping: 24.5,
+            stiffness,
+            damping,
             asymmetric: true,
+            preset: SpringPreset::FluidExpansion,
         }
     }
 
     pub fn volume_spring(val: f32) -> Self {
-        Self {
-            value: val,
-            target: val,
-            velocity: 0.0,
-            stiffness: 260.0,
-            damping: 24.0,
-            asymmetric: false,
-        }
+        Self::from_preset(val, SpringPreset::VolumeSlider)
+    }
+
+    /// Instantly inject kinetic energy (px/s) without changing the target.
+    /// Used on click/press triggers to avoid a sluggish zero-velocity takeoff.
+    pub fn impulse(&mut self, delta_v: f32) {
+        self.velocity += delta_v;
+    }
+
+    /// Change target and simultaneously inject kinetic energy (px/s).
+    pub fn set_target_with_impulse(&mut self, new_target: f32, impulse: f32) {
+        self.target = new_target;
+        self.velocity += impulse;
     }
 
     /// Update spring simulation by dt (seconds) using 240Hz sub-stepping.
@@ -53,12 +108,12 @@ impl Spring {
         let h = clamped_dt / (steps as f32);
 
         let (k, d) = if self.asymmetric {
-            if self.target > self.value {
-                // Expanding / Growing: Apple elastic spring bounce (overshoot ~3%)
-                (230.0, 24.5)
+            if self.target >= self.value {
+                // Expanding / growing: juicy rubber bounce (~15% overshoot).
+                (220.0, 17.2)
             } else {
-                // Collapsing / Shrinking: Crisp, rapid Apple snap-back
-                (270.0, 30.0)
+                // Collapsing / shrinking: crisp, rapid snap-back.
+                (265.0, 21.0)
             }
         } else {
             (self.stiffness, self.damping)
@@ -72,7 +127,18 @@ impl Spring {
             self.value += self.velocity * h;
         }
 
-        if self.velocity.abs() < 0.05 && (self.value - self.target).abs() < 0.05 {
+        // Low-damping springs need a tighter settle window so we do not freeze
+        // the simulation at a low-velocity oscillation peak. Droplet wobble
+        // settles at an even tighter window to preserve the final ripple.
+        let settle_eps = if self.preset == SpringPreset::DropletWobble {
+            0.06
+        } else if d < 20.0 {
+            0.08
+        } else {
+            0.05
+        };
+
+        if self.velocity.abs() < settle_eps && (self.value - self.target).abs() < settle_eps {
             self.value = self.target;
             self.velocity = 0.0;
             false
@@ -81,4 +147,3 @@ impl Spring {
         }
     }
 }
-

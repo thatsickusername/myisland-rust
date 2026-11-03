@@ -172,7 +172,7 @@ fn boxes_for_gauss(sigma: f32) -> [usize; 3] {
     ]
 }
 
-fn gaussian_blur_alpha(
+pub(crate) fn gaussian_blur_alpha(
     data: &mut [u8],
     temp: &mut [u8],
     prefix: &mut [u32],

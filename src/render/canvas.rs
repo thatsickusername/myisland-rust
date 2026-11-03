@@ -147,8 +147,14 @@ impl LayeredCanvas {
     }
 
     /// Complete island content rendering, apply the exact squircle mask (overflow: hidden),
-    /// and composite onto the main surface.
-    pub fn end_island_content(&mut self, path: Option<&tiny_skia::Path>) {
+    /// and composite onto the main surface with an optional centered content transform.
+    pub fn end_island_content(
+        &mut self,
+        path: Option<&tiny_skia::Path>,
+        content_scale: f32,
+        center_x: f32,
+        center_y: f32,
+    ) {
         std::mem::swap(&mut self.pixmap, &mut self.content_pixmap);
         if let Some(p) = path {
             self.mask.clear();
@@ -156,7 +162,23 @@ impl LayeredCanvas {
             self.content_pixmap.apply_mask(&self.mask);
         }
         let paint = PixmapPaint::default();
-        self.pixmap.draw_pixmap(0, 0, self.content_pixmap.as_ref(), &paint, Transform::identity(), None);
+        let mut transform = Transform::from_translate(-center_x, -center_y);
+        transform = transform.post_scale(content_scale, content_scale);
+        transform = transform.post_translate(center_x, center_y);
+        self.pixmap.draw_pixmap(
+            0,
+            0,
+            self.content_pixmap.as_ref(),
+            &paint,
+            transform,
+            None,
+        );
+    }
+
+    /// Convenience wrapper for unscaled content compositing.
+    #[allow(dead_code)]
+    pub fn end_island_content_plain(&mut self, path: Option<&tiny_skia::Path>) {
+        self.end_island_content(path, 1.0, 0.0, 0.0);
     }
 
     /// Present the pixmap to the Win32 layered window.

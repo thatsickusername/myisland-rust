@@ -30,6 +30,8 @@ impl CompactRenderer {
         t: f32,
         clip_copied_banner_until: Option<std::time::Instant>,
         is_rest: bool,
+        content_scale: f32,
+        volume_stretch: f32,
     ) -> bool {
         let cy = h / 2.0;
         let left = island_x + 14.0;
@@ -133,10 +135,11 @@ impl CompactRenderer {
 
             Self::draw_speaker_icon(canvas, left_speaker_x, cy, is_muted, volume, 1.0);
 
-            let bar_x = island_x + 46.0;
-            let bar_w = w - 92.0;
             let bar_h = 5.0;
             let bar_y = cy - bar_h / 2.0;
+            let stretch = 1.0 + volume_stretch.clamp(-0.18, 0.18);
+            let bar_w = (w - 92.0) * stretch;
+            let bar_x = island_x + (w - bar_w) / 2.0;
 
             // Track
             let mut bg_paint = Paint::default();
@@ -215,7 +218,7 @@ impl CompactRenderer {
                                 &mut canvas.pixmap.as_mut(),
                                 island_x + w / 2.0,
                                 cy,
-                                0.95,
+                                0.95 * content_scale,
                                 pointer_x,
                                 pointer_y,
                                 is_music_playing,
@@ -273,7 +276,7 @@ impl CompactRenderer {
                             &mut canvas.pixmap.as_mut(),
                             cx,
                             cy,
-                            (1.0 - copied_alpha).clamp(0.0, 1.0),
+                            (1.0 - copied_alpha).clamp(0.0, 1.0) * content_scale,
                             pointer_x,
                             pointer_y,
                             is_music_playing,
@@ -289,7 +292,7 @@ impl CompactRenderer {
                         &mut canvas.pixmap.as_mut(),
                         cx,
                         cy,
-                        1.0,
+                        1.0 * content_scale,
                         pointer_x,
                         pointer_y,
                         is_music_playing,
@@ -305,13 +308,15 @@ impl CompactRenderer {
             // 3. Right: Real-time Sound Wave Visualizer in album art dominant color
             let [cr, cg, cb] = album_art.dominant_color;
             let viz_color = Color::from_rgba8(cr, cg, cb, 255);
+            let viz_w = 32.0 * content_scale;
+            let viz_h = 16.0 * content_scale;
             let _viz_moving = visualizer.draw(
                 &mut canvas.pixmap.as_mut(),
                 "compact",
-                right - 34.0,
+                right - 34.0 + (32.0 - viz_w) * 0.5,
                 cy,
-                32.0,
-                16.0,
+                viz_w,
+                viz_h,
                 viz_color,
                 6,
                 is_music_playing,
@@ -322,7 +327,7 @@ impl CompactRenderer {
             if is_music_playing {
                 is_animating = true;
             }
-        } else if primary_activity == Some(ActivityType::Focus) {
+        } else if primary_activity == Some(ActivityType::Focus) && !is_rest {
             // ==========================================
             // Focus Compact View (Timer Ring + Eyes + Time)
             // ==========================================
@@ -381,11 +386,11 @@ impl CompactRenderer {
                 is_animating = true;
             }
 
-            // Time string on right
-            let s_tot = focus_left_ms / 1000;
-            let time_str = format!("{}:{:02}", s_tot / 60, s_tot % 60);
+            // Time string on right (formatted and right-aligned like MyIsland index.html line 3466)
+            let time_str = crate::ui::format_focus_timer(focus_left_ms);
             let orange = Color::from_rgba8(240, 160, 100, 255);
-            canvas.draw_text(&time_str, right - 32.0, cy - 4.0, 12.0, orange, true);
+            let tw = canvas.measure_text_width(&time_str, 13.0, true);
+            canvas.draw_text(&time_str, right - tw, cy - 7.0, 13.0, orange, true);
         } else {
             // ==========================================
             // Standard Compact Mode (Idle / Hovered) - MyIsland lines 3544-3572

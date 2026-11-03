@@ -424,7 +424,7 @@ impl MascotEngine {
             }
         }
 
-        let is_animating = self.is_blinking
+        let mut is_animating = self.is_blinking
             || (now.duration_since(self.state_start).as_millis() as u64) < self.state_duration_ms
             || state == MascotState::MusicPlaying
             || (raw_target_x - self.smooth_look_x).abs() > 0.02
@@ -598,12 +598,13 @@ impl MascotEngine {
             }
         }
 
-        // Sweat drop
+        // Sweat drop (Appears once every 3.6 seconds for ~900ms)
         if draw_sweat_drop {
             let cycle = now_ms as u64 % 3600;
             if cycle < 900 {
+                is_animating = true;
                 let drop_phase = (cycle as f32) / 900.0;
-                let drop_y = -2.0 + drop_phase * 10.0;
+                let drop_y = root_y - 2.0 + drop_phase * 10.0;
                 let drop_alpha = (drop_phase * PI).sin();
 
                 let mut drop_paint = Paint::default();

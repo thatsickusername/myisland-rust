@@ -11,14 +11,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 use config::*;
-use physics::{ParticleSystem, Spring};
+use physics::{ParticleSystem, Spring, SpringPreset};
 use platform::{
     AudioCaptureService, FullscreenDetector, GsmtcService, MediaControlCmd, MediaState,
     NotificationService, VolumeManager, Win32Window,
 };
 use render::{
     build_island_path, build_liquid_bridge_path, AlbumArtManager, LayeredCanvas, MascotEngine,
-    MascotState, ShadowRenderer, Visualizer,
+    MascotState, ShadowRenderer, Visualizer, LIQUID_BRIDGE_MAX_GAP,
 };
 use tiny_skia::{PathBuilder, Transform};
 use state::{
@@ -41,7 +41,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PostQuitMessage, TranslateMessage, MSG, WM_CLIPBOARDUPDATE,
-    WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_RBUTTONUP,
+    WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONUP,
 };
 
 static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
@@ -85,6 +86,17 @@ unsafe extern "system" fn window_proc(
             let screen_y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
             let px = screen_x - WIN_X.load(Ordering::Relaxed);
             let py = screen_y - WIN_Y.load(Ordering::Relaxed);
+
+            if IS_EXPANDED.load(Ordering::Relaxed) {
+                let exp_x = ((WINDOW_WIDTH as i32) - (DIMS_EXPANDED.w as i32)) / 2;
+                if px >= exp_x - 14
+                    && px <= exp_x + (DIMS_EXPANDED.w as i32) + 14
+                    && py >= 0
+                    && py <= (DIMS_EXPANDED.h as i32) + 14
+                {
+                    return LRESULT(HTCLIENT);
+                }
+            }
 
             let hx = HIT_X.load(Ordering::Relaxed);
             let hy = HIT_Y.load(Ordering::Relaxed);
@@ -169,12 +181,24 @@ fn run_app() -> windows::core::Result<()> {
 
     let mut volume_spring = Spring::volume_spring(65.0);
 
+    // Apple-fluid accessory springs
+    let mut content_scale_spring = Spring::from_preset(1.0, SpringPreset::FluidExpansion);
+    content_scale_spring.target = 1.0;
+    let mut volume_stretch_spring = Spring::new(0.0, 300.0, 20.0);
+    let mut sec_wobble_w = Spring::from_preset(0.0, SpringPreset::DropletWobble);
+    let mut sec_wobble_x = Spring::from_preset(0.0, SpringPreset::DropletWobble);
+    let mut press_active = false;
+    let mut expanded_since: Option<Instant> = None;
+    let mut impulse_state = IslandState::Rest;
+    let mut was_bridge_attached = false;
+
     // 6. State Managers & Engines
     let mut current_state = IslandState::Rest;
     let mut previous_state = IslandState::Rest;
     let mut is_auto_tucked = false;
     let mut leave_timer_start: Option<Instant> = None;
     let mut expanded_leave_timer: Option<Instant> = None;
+    let mut last_secondary_app: Option<ActivityType> = None;
 
     let mut current_app: usize = 0;
     let mut scroll_wheel_progress: f32 = 0.0;
@@ -212,9 +236,12 @@ fn run_app() -> windows::core::Result<()> {
     // Focus Timer state
     let mut focus_active = false;
     let mut focus_paused = false;
-    let focus_chosen_sec: u64 = 15 * 60; // 15 mins default
+    let mut focus_chosen_sec: u64 = 15 * 60; // 15 mins default
     let mut focus_end_time: Option<Instant> = None;
     let mut focus_paused_remaining = std::time::Duration::from_secs(15 * 60);
+    let mut is_dragging_ruler = false;
+    let mut ruler_drag_start_x: f32 = 0.0;
+    let mut ruler_drag_start_mins: i32 = 15;
 
     // Volume HUD state
     let mut is_volume_hud_active = false;
@@ -408,6 +435,8 @@ fn run_app() -> windows::core::Result<()> {
                             let new_vol = (vol + step).clamp(0.0, 100.0);
                             volume_mgr.set_volume(new_vol);
                             volume_spring.target = new_vol;
+                            volume_stretch_spring.target = 0.0;
+                            volume_stretch_spring.impulse((delta as f32) * 0.008);
                             is_volume_hud_active = true;
                             volume_hud_until = Instant::now() + std::time::Duration::from_millis(2500);
                         } else if current_state == IslandState::Expanded {
@@ -432,6 +461,17 @@ fn run_app() -> windows::core::Result<()> {
                                 // Hovering over notes panel: scroll notes vertically line-by-line!
                                 let dir = if delta < 0 { 1.0 } else { -1.0 };
                                 target_notes_scroll = (target_notes_scroll + dir).max(0.0);
+                            } else if current_app == 3 && is_over_body {
+                                // Focus app: mouse wheel adjusts chosen minutes (matching MyIsland index.html line 2733)
+                                if !focus_active {
+                                    let dir = if delta > 0 { 1 } else { -1 };
+                                    let curr_m = ((focus_chosen_sec as f32 / 60.0).round() as i32).clamp(1, 60);
+                                    let next_m = (curr_m + dir).clamp(1, 60);
+                                    if next_m as u64 * 60 != focus_chosen_sec {
+                                        focus_chosen_sec = next_m as u64 * 60;
+                                        is_dirty = true;
+                                    }
+                                }
                             } else {
                                 let dir = if delta < 0 { 1.0 } else { -1.0 };
                                 target_scroll_index += dir;
@@ -445,7 +485,63 @@ fn run_app() -> windows::core::Result<()> {
                             }
                         }
                     }
+                    WM_LBUTTONDOWN => {
+                        let (px, py, _) = window.get_cursor_relative();
+                        let w_cur = spring_w.value;
+                        let island_x_cur = ((WINDOW_WIDTH as f32) - w_cur) / 2.0;
+                        if current_state == IslandState::Expanded && current_app == 3 && !focus_active {
+                            let body_x = island_x_cur + 22.0;
+                            let body_y = 44.0;
+                            let body_w = w_cur - 44.0;
+                            let ruler_x = body_x + 6.0;
+                            let ruler_y = body_y + 2.0;
+                            let ruler_w = body_w - 12.0;
+                            let ruler_h = 50.0;
+                            if px >= ruler_x && px <= ruler_x + ruler_w && py >= ruler_y && py <= ruler_y + ruler_h {
+                                is_dragging_ruler = true;
+                                ruler_drag_start_x = px;
+                                ruler_drag_start_mins = ((focus_chosen_sec as f32 / 60.0).round() as i32).clamp(1, 60);
+                                windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(window.hwnd);
+                            }
+                        }
+
+                        // Haptic-feel press compression on the main pill.
+                        let h_cur = spring_h.value;
+                        let over_main = px >= island_x_cur - 8.0
+                            && px <= island_x_cur + w_cur + 8.0
+                            && py >= 0.0
+                            && py <= h_cur + 8.0;
+                        if over_main {
+                            press_active = true;
+                            content_scale_spring.target = 0.93;
+                            is_dirty = true;
+                        }
+                    }
+                    WM_MOUSEMOVE => {
+                        if is_dragging_ruler {
+                            let (px, _, _) = window.get_cursor_relative();
+                            let delta_x = px - ruler_drag_start_x;
+                            let delta_mins = -(delta_x / 10.0).round() as i32;
+                            let new_mins = (ruler_drag_start_mins + delta_mins).clamp(1, 60);
+                            if (new_mins as u64 * 60) != focus_chosen_sec {
+                                focus_chosen_sec = new_mins as u64 * 60;
+                                is_dirty = true;
+                            }
+                        }
+                    }
                     WM_LBUTTONUP => {
+                        if is_dragging_ruler {
+                            is_dragging_ruler = false;
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                            is_dirty = true;
+                        }
+                        if press_active {
+                            press_active = false;
+                            content_scale_spring.set_target_with_impulse(1.0, 0.9);
+                            spring_h.impulse(45.0);
+                            spring_w.impulse(30.0);
+                            is_dirty = true;
+                        }
                         let (px, py, _) = window.get_cursor_relative();
                         let w_cur = spring_w.value;
                         let island_x_cur = ((WINDOW_WIDTH as f32) - w_cur) / 2.0;
@@ -459,11 +555,55 @@ fn run_app() -> windows::core::Result<()> {
                                 if activity_mgr.active_notification.is_some() {
                                     activity_mgr.dismiss_notification();
                                 } else {
+                                    let (primary_act, sec_act) = activity_mgr.get_activities();
+                                    let sec_w = sec_spring_w.value;
+                                    let sec_h = sec_spring_h.value;
+                                    let sec_x = sec_spring_x.value;
+
+                                    let is_sec_clicked = sec_act.is_some()
+                                        && sec_w > 8.0
+                                        && px >= sec_x - 8.0
+                                        && px <= sec_x + sec_w + 8.0
+                                        && py >= 0.0
+                                        && py <= sec_h + 8.0;
+
+                                    if is_sec_clicked {
+                                        let target_app = match sec_act {
+                                            Some(ActivityType::Focus) => 3,
+                                            Some(ActivityType::Music) => 0,
+                                            _ => 0,
+                                        };
+                                        current_app = target_app;
+                                        target_scroll_index = target_app as f32;
+                                        scroll_spring.value = target_app as f32;
+                                        scroll_spring.target = target_app as f32;
+                                        scroll_wheel_progress = target_app as f32;
+                                    } else {
+                                        if let Some(primary) = primary_act {
+                                            let target_app = match primary {
+                                                ActivityType::Focus => 3,
+                                                ActivityType::Music => 0,
+                                            };
+                                            current_app = target_app;
+                                            target_scroll_index = target_app as f32;
+                                            scroll_spring.value = target_app as f32;
+                                            scroll_spring.target = target_app as f32;
+                                            scroll_wheel_progress = target_app as f32;
+                                        }
+                                    }
+
                                     current_state = IslandState::Expanded;
+                                    expanded_leave_timer = None;
+                                    leave_timer_start = None;
                                     mascot.trigger_state(MascotState::IdleHappy, 1500);
+                                    is_dirty = true;
                                 }
                             }
                         } else if current_state == IslandState::Expanded {
+                            let exp_x = ((WINDOW_WIDTH as f32) - DIMS_EXPANDED.w) / 2.0;
+                            let is_outside_card = px < exp_x || px > exp_x + DIMS_EXPANDED.w || py > DIMS_EXPANDED.h;
+                            let can_collapse_outside = is_outside_card && spring_w.value >= DIMS_EXPANDED.w - 40.0;
+
                             if px >= island_x_cur + w_cur - 38.0
                                 && px <= island_x_cur + w_cur - 16.0
                                 && py >= 9.0
@@ -502,7 +642,7 @@ fn run_app() -> windows::core::Result<()> {
                                     gsmtc.send_command(MediaControlCmd::Previous);
                                 } else if (px - (ctl_x + 17.0)).abs() < 14.0 && (py - ctrl_y).abs() < 14.0 {
                                     gsmtc.send_command(MediaControlCmd::Next);
-                                } else if px < island_x_cur || px > island_x_cur + w_cur || py > spring_h.value {
+                                } else if can_collapse_outside {
                                     current_state = IslandState::Compact;
                                 }
                             } else if current_app == 1 {
@@ -549,7 +689,7 @@ fn run_app() -> windows::core::Result<()> {
                                     }
                                 }
 
-                                if !handled_clip && (px < island_x_cur || px > island_x_cur + w_cur || py > spring_h.value) {
+                                if !handled_clip && can_collapse_outside {
                                     current_state = IslandState::Compact;
                                 }
                             } else if current_app == 2 {
@@ -570,27 +710,40 @@ fn run_app() -> windows::core::Result<()> {
                                         notes_focused = false;
                                         NOTES_FOCUSED.store(false, Ordering::SeqCst);
                                     }
-                                    if px < island_x_cur || px > island_x_cur + w_cur || py > spring_h.value {
+                                    if can_collapse_outside {
                                         current_state = IslandState::Compact;
                                     }
                                 }
                             } else if current_app == 3 {
-                                // Focus app: start/pause/stop
+                                // Focus app: start/pause/stop (matching MyIsland index.html lines 2622, 2623, 2740)
                                 let body_x = island_x_cur + 22.0;
                                 let body_y = 44.0;
                                 let body_w = w_cur - 44.0;
                                 if !focus_active {
-                                    if px >= body_x && px <= body_x + body_w && py >= body_y + 40.0 && py <= body_y + 75.0 {
+                                    // Start Timer button: btn_x = body_x + 10.0, btn_y = body_y + 55.0, btn_w = 126.0, btn_h = 35.0
+                                    let btn_x = body_x + 10.0;
+                                    let btn_y = body_y + 55.0;
+                                    let btn_w = 126.0;
+                                    let btn_h = 35.0;
+                                    if px >= btn_x && px <= btn_x + btn_w && py >= btn_y && py <= btn_y + btn_h {
                                         focus_active = true;
                                         focus_paused = false;
                                         focus_end_time = Some(Instant::now() + std::time::Duration::from_secs(focus_chosen_sec));
                                         activity_mgr.update_focus(true);
                                         mascot.trigger_state(MascotState::FocusActive, 3000);
-                                    } else if px < island_x_cur || px > island_x_cur + w_cur || py > spring_h.value {
+                                        is_dirty = true;
+                                    } else if can_collapse_outside {
                                         current_state = IslandState::Compact;
                                     }
                                 } else {
-                                    if px >= body_x + body_w - 120.0 && px <= body_x + body_w - 60.0 && py >= body_y + 15.0 && py <= body_y + 45.0 {
+                                    // Action buttons column: width 120px at right side
+                                    let btn_x = body_x + body_w - 130.0;
+                                    let btn_w = 120.0;
+                                    let btn_h = 35.0;
+                                    let pause_y = body_y + 7.0;
+                                    let stop_y = body_y + 50.0;
+
+                                    if px >= btn_x && px <= btn_x + btn_w && py >= pause_y && py <= pause_y + btn_h {
                                         if !focus_paused {
                                             focus_paused = true;
                                             if let Some(end) = focus_end_time {
@@ -601,17 +754,19 @@ fn run_app() -> windows::core::Result<()> {
                                             focus_paused = false;
                                             focus_end_time = Some(Instant::now() + focus_paused_remaining);
                                         }
-                                    } else if px >= body_x + body_w - 55.0 && px <= body_x + body_w && py >= body_y + 15.0 && py <= body_y + 45.0 {
+                                        is_dirty = true;
+                                    } else if px >= btn_x && px <= btn_x + btn_w && py >= stop_y && py <= stop_y + btn_h {
                                         focus_active = false;
                                         focus_paused = false;
                                         focus_end_time = None;
                                         activity_mgr.update_focus(false);
                                         mascot.trigger_state(MascotState::FocusFailed, 2500);
-                                    } else if px < island_x_cur || px > island_x_cur + w_cur || py > spring_h.value {
+                                        is_dirty = true;
+                                    } else if can_collapse_outside {
                                         current_state = IslandState::Compact;
                                     }
                                 }
-                            } else if px < island_x_cur || px > island_x_cur + w_cur || py > spring_h.value {
+                            } else if can_collapse_outside {
                                 current_state = IslandState::Compact;
                             }
                         }
@@ -878,10 +1033,16 @@ fn run_app() -> windows::core::Result<()> {
                 && pointer_y >= 0.0
                 && pointer_y <= (h_val.max(DIMS_EXPANDED.h) + 14.0)
         } else {
-            pointer_x >= island_x - 8.0
+            let over_primary = pointer_x >= island_x - 8.0
                 && pointer_x <= island_x + w_val + 8.0
                 && pointer_y >= 0.0
-                && pointer_y <= h_val + 8.0
+                && pointer_y <= h_val + 8.0;
+            let over_sec = (sec_spring_w.target > 0.0 || sec_spring_w.value > 4.0)
+                && pointer_x >= sec_spring_x.value - 8.0
+                && pointer_x <= sec_spring_x.value + sec_spring_w.value + 8.0
+                && pointer_y >= 0.0
+                && pointer_y <= sec_spring_h.value + 8.0;
+            over_primary || over_sec
         };
 
         // Update atomic bounds for native WM_NCHITTEST
@@ -891,20 +1052,18 @@ fn run_app() -> windows::core::Result<()> {
         HIT_H.store(h_val as i32, Ordering::Relaxed);
 
         // 2. Hover state transitions (executed BEFORE computing targets)
+        let (primary_act, _sec_act) = activity_mgr.get_activities();
+        let has_active_content = primary_act.is_some()
+            || focus_active
+            || activity_mgr.active_notification.is_some()
+            || is_volume_hud_active;
+
         if current_state == IslandState::Rest {
-            let has_active_content = latest_media.is_playing
-                || focus_active
-                || activity_mgr.active_notification.is_some()
-                || is_volume_hud_active;
             if is_over_main || has_active_content {
                 current_state = IslandState::Compact;
                 leave_timer_start = None;
             }
         } else if current_state == IslandState::Compact {
-            let has_active_content = latest_media.is_playing
-                || focus_active
-                || activity_mgr.active_notification.is_some()
-                || is_volume_hud_active;
             if !is_over_main && !has_active_content {
                 if let Some(start) = leave_timer_start {
                     if now.duration_since(start).as_millis() >= 220 {
@@ -936,13 +1095,48 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
+        // Kinetic momentum on state changes: immediate tactile takeoff instead
+        // of a sluggish zero-velocity ramp.
+        if current_state != impulse_state {
+            match (impulse_state, current_state) {
+                (IslandState::Rest, IslandState::Compact) => {
+                    spring_w.impulse(120.0);
+                }
+                (IslandState::Compact, IslandState::Rest) => {
+                    spring_w.impulse(-140.0);
+                }
+                (IslandState::Tucked, IslandState::Compact) => {
+                    spring_w.impulse(100.0);
+                }
+                (_, IslandState::Expanded) => {
+                    spring_h.impulse(180.0);
+                    spring_w.impulse(200.0);
+                }
+                (IslandState::Expanded, IslandState::Compact) => {
+                    spring_h.impulse(-220.0);
+                    spring_w.impulse(-160.0);
+                }
+                _ => {}
+            }
+            impulse_state = current_state;
+            is_dirty = true;
+        }
+
+        if current_state == IslandState::Expanded {
+            if expanded_since.is_none() {
+                expanded_since = Some(now);
+            }
+        } else {
+            expanded_since = None;
+        }
+
         if current_state != prev_state {
             is_dirty = true;
             prev_state = current_state;
         }
 
         // 3. Target Dimensions State Machine (computed from newly resolved state)
-        let target_dims = match current_state {
+        let mut target_dims = match current_state {
             IslandState::Rest => DIMS_REST,
             IslandState::Compact => {
                 let (primary, _) = activity_mgr.get_activities();
@@ -964,12 +1158,30 @@ fn run_app() -> windows::core::Result<()> {
             IslandState::Tucked => DIMS_TUCKED,
         };
 
+        // Active press bounce: compress the membrane while the button is held.
+        if press_active {
+            target_dims.w *= 0.96;
+            target_dims.h *= 0.95;
+            target_dims.r *= 0.96;
+        }
+
         spring_w.target = target_dims.w;
         spring_h.target = target_dims.h;
         spring_r.target = target_dims.r;
 
         // Secondary bubble target
         let (primary_act, sec_act) = activity_mgr.get_activities();
+        if sec_act.is_some() {
+            last_secondary_app = sec_act;
+        }
+
+        let target_sec_x = if current_state == IslandState::Compact && sec_act.is_some() {
+            island_x + target_dims.w + SECONDARY_GAP
+        } else {
+            island_x + target_dims.w - sec_spring_w.value.max(20.0)
+        };
+        sec_spring_x.target = target_sec_x;
+
         if current_state == IslandState::Compact && sec_act.is_some() {
             sec_spring_w.target = DIMS_SECONDARY.w;
             sec_spring_h.target = DIMS_SECONDARY.h;
@@ -977,6 +1189,7 @@ fn run_app() -> windows::core::Result<()> {
         } else {
             sec_spring_w.target = 0.0;
             sec_spring_h.target = 0.0;
+            sec_spring_r.target = 0.0;
         }
 
         let dt = (now.duration_since(last_frame_time).as_secs_f32()).min(0.04);
@@ -991,16 +1204,35 @@ fn run_app() -> windows::core::Result<()> {
         let s6 = sec_spring_r.update(dt);
         let s7 = sec_spring_x.update(dt);
         let s8 = volume_spring.update(dt);
+        let s9 = content_scale_spring.update(dt);
+        volume_stretch_spring.target = 0.0;
+        let s10 = volume_stretch_spring.update(dt);
+
+        // Liquid-bridge detachment: when the neck snaps, ring the secondary pill
+        // with a short high-frequency droplet wobble.
+        let live_island_x = ((WINDOW_WIDTH as f32) - spring_w.value) / 2.0;
+        let live_gap = sec_spring_x.value - (live_island_x + spring_w.value);
+        let bridge_attached = sec_spring_w.value > 1.5
+            && live_gap > -2.0
+            && live_gap < LIQUID_BRIDGE_MAX_GAP;
+        if was_bridge_attached && !bridge_attached && sec_spring_w.value > 1.5 {
+            sec_wobble_w.impulse(-42.0);
+            sec_wobble_x.impulse(28.0);
+        }
+        was_bridge_attached = bridge_attached;
+        let s11 = sec_wobble_w.update(dt);
+        let s12 = sec_wobble_x.update(dt);
+
         let has_secondary = sec_act.is_some() || sec_spring_w.value > 0.5;
-        let springs_moving = s1 || s2 || s3 || s8
-            || (has_secondary && (s4 || s5 || s6 || s7))
+        let springs_moving = s1 || s2 || s3 || s8 || s9 || s10
+            || (has_secondary && (s4 || s5 || s6 || s7 || s11 || s12))
             || (spring_w.value - spring_w.target).abs() > 0.15
             || (spring_h.value - spring_h.target).abs() > 0.15
             || (spring_r.value - spring_r.target).abs() > 0.15
             || (has_secondary && (sec_spring_w.value - sec_spring_w.target).abs() > 0.15)
             || (has_secondary && (sec_spring_x.value - sec_spring_x.target).abs() > 0.15);
 
-        let particles_moving = particles.update();
+        let particles_moving = particles.update(WINDOW_HEIGHT as f32);
 
         // Synchronize Expanded window style & activation state
         let is_exp = current_state == IslandState::Expanded;
@@ -1026,6 +1258,13 @@ fn run_app() -> windows::core::Result<()> {
         }
 
         let mut ui_animating = false;
+
+        // Staggered expanded-content entrance progress (0 → 1 over 450ms).
+        let content_entrance = expanded_since
+            .map_or(1.0, |t| (now.duration_since(t).as_secs_f32() / 0.45).clamp(0.0, 1.0));
+        if expanded_since.is_some() && content_entrance < 1.0 {
+            ui_animating = true;
+        }
 
         // Carousel progression smoothing with fluid 240Hz physical spring
         scroll_spring.target = target_scroll_index;
@@ -1075,6 +1314,7 @@ fn run_app() -> windows::core::Result<()> {
             || particles_moving
             || ui_animating
             || cursor_active
+            || is_dragging_ruler
             || leave_timer_start.is_some()
             || expanded_leave_timer.is_some()
             || (focus_active && !focus_paused)
@@ -1089,6 +1329,18 @@ fn run_app() -> windows::core::Result<()> {
         if is_dirty {
             canvas.clear();
 
+            // Liquid volume conservation (squash & stretch): outward width velocity
+            // momentarily compresses the membrane height.
+            let settle_factor =
+                (1.0 - (spring_h.value - spring_h.target).abs() / 60.0).clamp(0.0, 1.0);
+            let squash = (spring_w.velocity * 0.024 * settle_factor).clamp(-6.0, 6.0);
+            let eff_h = (h_val - squash).max(4.0);
+
+            // Complementary lateral bulge when the membrane compresses vertically.
+            let lateral = (squash.abs() * 0.35).clamp(0.0, 2.5);
+            let eff_w = (w_val + lateral).max(4.0);
+            let eff_x = island_x - lateral * 0.5;
+
             // 1. Atmosphere Drop Shadow (True Gaussian blur matching MyIsland index.html lines 2988-2996)
         let (shadow_blur, shadow_dy) = match current_state {
             IslandState::Expanded => (34.0, 6.0),
@@ -1099,9 +1351,9 @@ fn run_app() -> windows::core::Result<()> {
         shadow_renderer.render_shadow(
             &mut canvas.pixmap.as_mut(),
             &build_island_path,
-            island_x,
-            w_val,
-            h_val,
+            eff_x,
+            eff_w,
+            eff_h,
             spring_r.value,
             shadow_blur,
             shadow_dy,
@@ -1110,7 +1362,7 @@ fn run_app() -> windows::core::Result<()> {
         );
 
         // Island Squircle Geometry Path
-        let island_path = build_island_path(island_x, 0.0, w_val, h_val, spring_r.value);
+        let island_path = build_island_path(eff_x, 0.0, eff_w, eff_h, spring_r.value);
 
         // Pitch Black Surface
         if let Some(ref path) = island_path {
@@ -1165,22 +1417,20 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
-        // Secondary Pill (Dual Activity)
-        let sec_w = sec_spring_w.value;
+        // Secondary Pill (Dual Activity) — with detachment wobble
+        let sec_w = (sec_spring_w.value + sec_wobble_w.value).max(1.5);
         let sec_h = sec_spring_h.value;
-        let target_sec_x = if current_state == IslandState::Compact && sec_act.is_some() {
-            island_x + w_val + SECONDARY_GAP
-        } else {
-            island_x + w_val - sec_w.max(20.0)
-        };
-        sec_spring_x.target = target_sec_x;
-        let sec_x = sec_spring_x.value;
+        let sec_x = sec_spring_x.value + sec_wobble_x.value;
 
-        if current_state != IslandState::Expanded && current_state != IslandState::Tucked && sec_w > 1.5 && sec_h > 1.5 {
+        if current_state == IslandState::Compact && sec_w > 1.5 && sec_h > 1.5 {
             SEC_HIT_X.store(sec_x as i32, Ordering::Relaxed);
             SEC_HIT_W.store(sec_w as i32, Ordering::Relaxed);
             SEC_HIT_H.store(sec_h as i32, Ordering::Relaxed);
+        } else {
+            SEC_HIT_W.store(0, Ordering::Relaxed);
+        }
 
+        if current_state != IslandState::Tucked && sec_w > 1.5 && sec_h > 1.5 {
             // Secondary Pill Drop Shadow (MyIsland line 3090: blur 18, offset Y 6)
             sec_shadow_renderer.render_shadow(
                 &mut canvas.pixmap.as_mut(),
@@ -1212,11 +1462,91 @@ fn run_app() -> windows::core::Result<()> {
                 sec_paint.set_color_rgba8(0, 0, 0, 255);
                 canvas.pixmap.fill_path(&sec_path, &sec_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
 
+                let sec_content_alpha = ((sec_w - 14.0) / 22.0).clamp(0.0, 1.0);
                 let mut stroke_paint = tiny_skia::Paint::default();
                 stroke_paint.anti_alias = true;
-                stroke_paint.set_color_rgba8(255, 255, 255, 28);
+                stroke_paint.set_color_rgba8(255, 255, 255, (28.0 * sec_content_alpha) as u8);
                 let stroke_1 = tiny_skia::Stroke { width: 1.0, ..Default::default() };
                 canvas.pixmap.stroke_path(&sec_path, &stroke_paint, &stroke_1, Transform::identity(), None);
+
+                // Render content inside secondary pill if size is sufficient
+                if sec_content_alpha > 0.01 && sec_w >= 20.0 && sec_h >= 18.0 {
+                    let sec_center = sec_x + sec_w / 2.0;
+                    let sec_cy = sec_h / 2.0;
+                    let display_sec = sec_act.or(last_secondary_app);
+
+                    if display_sec == Some(ActivityType::Focus) {
+                        // Circular timer progress icon in secondary pill (MyIsland index.html lines 3116-3132)
+                        let left_sec_ms = if focus_active { focus_left_ms } else { 0 };
+                        let sec_frac = if focus_total_ms > 0 {
+                            (left_sec_ms as f32 / focus_total_ms as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let rad = 8.5f32;
+                        let stroke_22 = tiny_skia::Stroke {
+                            width: 2.2,
+                            line_cap: tiny_skia::LineCap::Round,
+                            ..Default::default()
+                        };
+
+                        let mut bg_ring = tiny_skia::Paint::default();
+                        bg_ring.anti_alias = true;
+                        bg_ring.set_color_rgba8(240, 160, 100, (64.0 * sec_content_alpha) as u8);
+                        let mut pb_bg = PathBuilder::new();
+                        pb_bg.push_circle(sec_center, sec_cy, rad);
+                        if let Some(p) = pb_bg.finish() {
+                            canvas.pixmap.stroke_path(&p, &bg_ring, &stroke_22, Transform::identity(), None);
+                        }
+
+                        if sec_frac > 0.0 {
+                            let mut fg_ring = tiny_skia::Paint::default();
+                            fg_ring.anti_alias = true;
+                            fg_ring.set_color_rgba8(240, 160, 100, (255.0 * sec_content_alpha) as u8);
+                            let start_angle = -std::f32::consts::PI / 2.0;
+                            let end_angle = start_angle + sec_frac * std::f32::consts::PI * 2.0;
+                            let steps = 28;
+                            let mut pb_fg = PathBuilder::new();
+                            pb_fg.move_to(sec_center + rad * start_angle.cos(), sec_cy + rad * start_angle.sin());
+                            for s in 1..=steps {
+                                let a = start_angle + (end_angle - start_angle) * (s as f32 / steps as f32);
+                                pb_fg.line_to(sec_center + rad * a.cos(), sec_cy + rad * a.sin());
+                            }
+                            if let Some(p) = pb_fg.finish() {
+                                canvas.pixmap.stroke_path(&p, &fg_ring, &stroke_22, Transform::identity(), None);
+                            }
+                        }
+                    } else if display_sec == Some(ActivityType::Music) {
+                        // Mini visualizer in secondary pill (MyIsland index.html line 3135)
+                        let bar_color = tiny_skia::Color::from_rgba8(
+                            album_art_mgr.dominant_color[0],
+                            album_art_mgr.dominant_color[1],
+                            album_art_mgr.dominant_color[2],
+                            (255.0 * sec_content_alpha) as u8,
+                        );
+                        let mut bar_paint = tiny_skia::Paint::default();
+                        bar_paint.anti_alias = true;
+                        bar_paint.set_color(bar_color);
+
+                        let bar_w = 2.4f32;
+                        let gap = 2.0f32;
+                        let start_x = sec_center - (3.0 * bar_w + 2.0 * gap) / 2.0;
+                        let t = start_instant.elapsed().as_secs_f32();
+                        for i in 0..3 {
+                            let phase = t * 6.0 + (i as f32) * 1.8;
+                            let h = 4.0 + 8.0 * (phase.sin().abs());
+                            let bx = start_x + (i as f32) * (bar_w + gap);
+                            let by = sec_cy - h / 2.0;
+                            let mut pb = PathBuilder::new();
+                            if let Some(r) = tiny_skia::Rect::from_xywh(bx, by, bar_w, h) {
+                                pb.push_rect(r);
+                                if let Some(p) = pb.finish() {
+                                    canvas.pixmap.fill_path(&p, &bar_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else {
             SEC_HIT_W.store(0, Ordering::Relaxed);
@@ -1251,6 +1581,7 @@ fn run_app() -> windows::core::Result<()> {
                 island_x,
                 w_val,
                 h_val,
+                content_entrance,
                 current_app,
                 scroll_wheel_progress,
                 pointer_x,
@@ -1301,13 +1632,20 @@ fn run_app() -> windows::core::Result<()> {
                 t_sec,
                 clip_copied_banner_until,
                 is_rest,
+                (w_val / DIMS_COMPACT.w).clamp(0.92, 1.08),
+                volume_stretch_spring.value,
             );
             if anim {
                 ui_animating = true;
             }
         }
 
-        canvas.end_island_content(island_path.as_ref());
+        canvas.end_island_content(
+            island_path.as_ref(),
+            content_scale_spring.value.clamp(0.88, 1.06),
+            island_x + w_val / 2.0,
+            h_val / 2.0,
+        );
 
         // Apple Keyline Outline on top of clipped content
         if let Some(ref path) = island_path {
@@ -1326,12 +1664,37 @@ fn run_app() -> windows::core::Result<()> {
 
         // Draw Confetti Particles
         for p in &particles.particles {
+            let alpha = p.alpha.clamp(0.0, 1.0);
+
+            // Soft colored glow first (Canvas shadowColor = p.color / shadowBlur = 4)
+            if let Some(ref glow) = p.glow {
+                let mut glow_paint = tiny_skia::PixmapPaint::default();
+                glow_paint.opacity = alpha;
+                glow_paint.quality = tiny_skia::FilterQuality::Bilinear;
+
+                let cx = glow.width() as f32 * 0.5;
+                let cy = glow.height() as f32 * 0.5;
+                // Apply: center sprite -> rotate -> move to particle position.
+                let glow_t = Transform::from_translate(-cx, -cy)
+                    .post_rotate(p.rot.to_degrees())
+                    .post_translate(p.x, p.y);
+                canvas.pixmap.draw_pixmap(
+                    0,
+                    0,
+                    glow.as_ref(),
+                    &glow_paint,
+                    glow_t,
+                    None,
+                );
+            }
+
             let mut paint = tiny_skia::Paint::default();
             paint.anti_alias = true;
-            let a = (p.alpha.clamp(0.0, 1.0) * 255.0) as u8;
+            let a = (alpha * 255.0) as u8;
             paint.set_color_rgba8(p.color[0], p.color[1], p.color[2], a);
 
-            let t = Transform::from_translate(p.x, p.y).post_rotate(p.rot.to_degrees());
+            // Rotate around the particle's own center, then place it at (x, y).
+            let t = Transform::from_rotate(p.rot.to_degrees()).post_translate(p.x, p.y);
             let mut pb = PathBuilder::new();
             pb.push_rect(tiny_skia::Rect::from_xywh(-p.w / 2.0, -p.h / 2.0, p.w, p.h).unwrap());
             if let Some(path) = pb.finish() {
@@ -1353,6 +1716,7 @@ fn run_app() -> windows::core::Result<()> {
             || particles_moving
             || ui_animating
             || cursor_active
+            || is_dragging_ruler
             || (focus_active && !focus_paused)
             || activity_mgr.active_notification.is_some()
             || is_volume_hud_active

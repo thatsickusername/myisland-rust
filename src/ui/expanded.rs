@@ -15,6 +15,7 @@ impl ExpandedRenderer {
         island_x: f32,
         w: f32,
         h: f32,
+        content_entrance: f32,
         current_app: usize,
         scroll_progress: f32,
         pointer_x: f32,
@@ -42,6 +43,14 @@ impl ExpandedRenderer {
 
         let content_alpha = ((h - 80.0) / 45.0).clamp(0.0, 1.0);
         let cx = island_x + w / 2.0;
+
+        // Staggered Apple-style entrance: album art pops first, text rolls in,
+        // then controls bounce into place.
+        let e_album = Self::stagger(content_entrance, 0.0, 0.45);
+        let e_text = Self::stagger(content_entrance, 0.18, 0.50);
+        let e_controls = Self::stagger_back(content_entrance, 0.34, 0.58);
+        let header_dy = -4.0 * (1.0 - e_text);
+        let header_alpha = content_alpha * e_text;
 
         // 1. Small Companion eyes at top-left
         let animating = mascot.update_and_draw(
@@ -82,17 +91,24 @@ impl ExpandedRenderer {
             }
         };
 
-        canvas.draw_text(&time_str, cx - time_w - 8.0, 14.0, 13.0, Color::WHITE, true);
+        canvas.draw_text(
+            &time_str,
+            cx - time_w - 8.0,
+            14.0 + header_dy,
+            13.0,
+            Color::from_rgba8(255, 255, 255, (255.0 * header_alpha) as u8),
+            true,
+        );
 
-        let date_col = Color::from_rgba8(255, 255, 255, (115.0 * content_alpha) as u8);
-        canvas.draw_text(&date_full, cx + 8.0, 14.0, 11.5, date_col, false);
+        let date_col = Color::from_rgba8(255, 255, 255, (115.0 * header_alpha) as u8);
+        canvas.draw_text(&date_full, cx + 8.0, 14.0 + header_dy, 11.5, date_col, false);
 
         // 3. 3-Dots Menu Button
         let dot_cx = island_x + w - 27.0;
-        let dot_cy = 20.0;
+        let dot_cy = 20.0 + header_dy;
         let mut dot_paint = Paint::default();
         dot_paint.anti_alias = true;
-        dot_paint.set_color_rgba8(255, 255, 255, (165.0 * content_alpha) as u8);
+        dot_paint.set_color_rgba8(255, 255, 255, (165.0 * header_alpha) as u8);
 
         for i in [-1.0f32, 0.0, 1.0] {
             let mut pb = PathBuilder::new();
@@ -104,22 +120,22 @@ impl ExpandedRenderer {
 
         // 4. Header Divider Line
         let mut div_paint = Paint::default();
-        div_paint.set_color_rgba8(255, 255, 255, (20.0 * content_alpha) as u8);
+        div_paint.set_color_rgba8(255, 255, 255, (20.0 * header_alpha) as u8);
         let stroke_1 = Stroke { width: 1.0, ..Default::default() };
         let mut pb = PathBuilder::new();
-        pb.move_to(island_x + 16.0, 36.0);
-        pb.line_to(island_x + w - 16.0, 36.0);
+        pb.move_to(island_x + 16.0, 36.0 + header_dy);
+        pb.line_to(island_x + w - 16.0, 36.0 + header_dy);
         if let Some(p) = pb.finish() {
             canvas.pixmap.stroke_path(&p, &div_paint, &stroke_1, Transform::identity(), None);
         }
 
-        // 5. Active App Panel
+        // 5. Active App Panel (rolls in with a subtle parallax offset)
         let body_x = island_x + 22.0;
-        let body_y = 44.0;
+        let body_y = 44.0 + 9.0 * (1.0 - e_text);
         let body_w = w - 44.0;
 
         match current_app {
-            0 => Self::render_music(canvas, album_art, body_x, body_y, body_w, pointer_x, pointer_y, media, lyrics),
+            0 => Self::render_music(canvas, album_art, body_x, body_y, body_w, pointer_x, pointer_y, media, lyrics, e_album, e_text, e_controls),
             1 => Self::render_clipboard(canvas, body_x, body_y, body_w, h, content_alpha, clips, pointer_x, pointer_y, clip_copied_index, clip_scroll_progress),
             2 => Self::render_notes(canvas, body_x, body_y, body_w, clips, notes_focused, notes_cursor_pos, cursor_moved, target_notes_scroll, notes_scroll_progress),
             3 => Self::render_focus(
@@ -127,6 +143,8 @@ impl ExpandedRenderer {
                 body_x,
                 body_y,
                 body_w,
+                pointer_x,
+                pointer_y,
                 focus_active,
                 focus_paused,
                 focus_left_ms,
@@ -138,7 +156,7 @@ impl ExpandedRenderer {
 
         // 6. iPhone Camera Mode Selector (Carousel) - only shows when island is tall enough
         if h >= 110.0 {
-            let cam_alpha = ((h - 110.0) / 25.0).clamp(0.0, 1.0);
+            let cam_alpha = ((h - 110.0) / 25.0).clamp(0.0, 1.0) * e_controls;
             Self::render_camera_modes(canvas, island_x, h - 26.0, w, scroll_progress, cam_alpha);
         }
 
@@ -155,21 +173,33 @@ impl ExpandedRenderer {
         pointer_y: f32,
         media: &MediaState,
         lyrics: &LyricsState,
+        e_album: f32,
+        e_text: f32,
+        e_controls: f32,
     ) {
         let cs = 64.0;
 
-        // 1. Album Art Drop Shadow (MyIsland lines 3716-3718: rgba(0, 0, 0, 0.55), blur 12, offset Y 4)
+        // 1. Album Art Drop Shadow (pops in first with a soft scale-up)
+        let art_scale = 0.90 + 0.10 * e_album;
+        let art_inset = cs * (1.0 - art_scale) * 0.5;
+        let art_x = x + art_inset;
+        let art_y = y + art_inset;
+        let art_size = cs * art_scale;
+
         let mut shadow_paint = Paint::default();
         shadow_paint.anti_alias = true;
         shadow_paint.set_color_rgba8(0, 0, 0, 70);
         let mut pb = PathBuilder::new();
-        Self::add_round_rect(&mut pb, x - 1.0, y + 3.0, cs + 2.0, cs + 2.0, 11.0);
+        Self::add_round_rect(&mut pb, art_x - 1.0, art_y + 3.0, art_size + 2.0, art_size + 2.0, 11.0);
         if let Some(p) = pb.finish() {
             canvas.pixmap.fill_path(&p, &shadow_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
         }
 
         // 2. Album Art Box (64x64 with radius 10.0)
-        album_art.draw(&mut canvas.pixmap.as_mut(), x, y, cs, 10.0);
+        album_art.draw(&mut canvas.pixmap.as_mut(), art_x, art_y, art_size, 10.0);
+
+        // Text group rolls in just after the artwork.
+        let text_dy = (1.0 - e_text) * 6.0;
 
         // 3. Title and Artist with responsive truncation
         let tx = x + cs + 14.0;
@@ -206,11 +236,11 @@ impl ExpandedRenderer {
         };
 
         let title_str = canvas.truncate_to_width(&clean_t, title_w, 14.0, true);
-        canvas.draw_text(&title_str, tx, y + 8.0, 14.0, Color::WHITE, true);
+        canvas.draw_text(&title_str, tx, y + 8.0 + text_dy, 14.0, Color::WHITE, true);
 
         let artist_str = canvas.truncate_to_width(&clean_a, title_w, 12.0, false);
         let artist_col = Color::from_rgba8(255, 255, 255, 153);
-        canvas.draw_text(&artist_str, tx, y + 26.0, 12.0, artist_col, false);
+        canvas.draw_text(&artist_str, tx, y + 26.0 + text_dy, 12.0, artist_col, false);
 
         // 4. Synced Lyric line in expanded card (MyIsland lines 3770-3781)
         let (_, now_l, next_l) = lyrics.get_around_lyrics();
@@ -218,16 +248,16 @@ impl ExpandedRenderer {
         if !display_l.is_empty() {
             let [cr, cg, cb] = album_art.dominant_color;
             let lyric_col = Color::from_rgba8(cr, cg, cb, 255);
-            let ly_cy = y + 49.0;
+            let ly_cy = y + 49.0 + text_dy;
             Self::draw_music_note_icon(canvas, tx, ly_cy, lyric_col);
 
             let max_w = title_w - 14.0;
             let lyric_line = canvas.truncate_to_width(&display_l, max_w, 11.5, false);
-            canvas.draw_text(&lyric_line, tx + 12.0, y + 44.0, 11.5, lyric_col, false);
+            canvas.draw_text(&lyric_line, tx + 12.0, y + 44.0 + text_dy, 11.5, lyric_col, false);
         }
 
         // 5. Progress scrubber (MyIsland lines 3784-3813)
-        let bar_y = y + cs + 14.0;
+        let bar_y = y + cs + 14.0 + text_dy;
         let bx0 = x + 34.0;
         let bw_total = bw - 74.0;
 
@@ -266,8 +296,9 @@ impl ExpandedRenderer {
             }
         }
 
-        // 6. Media Buttons (Prev, Play/Pause, Next) - Exact MyIsland icons & hover colors
-        let ctrl_y = y + 28.0;
+        // 6. Media Buttons (Prev, Play/Pause, Next) - bounce into view last
+        let controls_dy = (1.0 - e_controls) * 10.0;
+        let ctrl_y = y + 28.0 + controls_dy;
         let right_pos = x + bw;
         let ctl_x = right_pos - 50.0;
         let btn_size = 26.0f32;
@@ -348,6 +379,20 @@ impl ExpandedRenderer {
         if let Some(p) = pb.finish() {
             canvas.pixmap.fill_path(&p, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
         }
+    }
+
+    /// Eased stagger progress in `[0, 1]` for a delayed entrance.
+    fn stagger(t: f32, delay: f32, duration: f32) -> f32 {
+        let local = ((t - delay) / duration).clamp(0.0, 1.0);
+        1.0 - (1.0 - local).powi(3)
+    }
+
+    /// Overshooting stagger used for controls so they bounce into place.
+    fn stagger_back(t: f32, delay: f32, duration: f32) -> f32 {
+        let local = ((t - delay) / duration).clamp(0.0, 1.0);
+        let c1 = 1.70158;
+        let c3 = c1 + 1.0;
+        1.0 + c3 * (local - 1.0).powi(3) + c1 * (local - 1.0).powi(2)
     }
 
     fn add_tri(pb: &mut PathBuilder, x0: f32, y: f32, s: f32, dir: f32) {
@@ -814,88 +859,332 @@ impl ExpandedRenderer {
         x: f32,
         y: f32,
         bw: f32,
+        pointer_x: f32,
+        pointer_y: f32,
         active: bool,
         paused: bool,
         left_ms: u64,
         total_ms: u64,
-        _chosen_sec: u64,
+        chosen_sec: u64,
     ) {
+        let orange = Color::from_rgba8(240, 160, 100, 255);
+
         if !active {
-            canvas.draw_text(
-                "Focus Session",
-                x + bw / 2.0 - 44.0,
-                y + 10.0,
-                14.0,
-                Color::WHITE,
-                true,
-            );
-            canvas.draw_text(
-                "15 minutes countdown with soft ambient chime",
-                x + bw / 2.0 - 110.0,
-                y + 28.0,
-                11.0,
-                Color::from_rgba8(255, 255, 255, 125),
-                false,
-            );
+            // Setup View (Precision Dynamic Dial Ruler Style - MyIsland index.html line 2626)
+            let total_minutes = 60;
+            let tick_width = 10.0f32;
+            let current_mins = ((chosen_sec as f32 / 60.0).round() as i32).clamp(1, total_minutes);
 
-            // Start Focus Button
-            let btn_w = 120.0;
-            let btn_x = x + (bw - btn_w) / 2.0;
-            let btn_y = y + 44.0;
-            let mut start_paint = Paint::default();
-            start_paint.set_color_rgba8(240, 160, 100, 255);
-            let mut pb = PathBuilder::new();
-            Self::add_round_rect(&mut pb, btn_x, btn_y, btn_w, 28.0, 14.0);
-            if let Some(p) = pb.finish() {
-                canvas.pixmap.fill_path(&p, &start_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-            }
-            canvas.draw_text("Start Focus", btn_x + 28.0, btn_y + 7.0, 12.5, Color::BLACK, true);
-        } else {
-            let s_tot = left_ms / 1000;
-            let time_str = format!("{}:{:02}", s_tot / 60, s_tot % 60);
-            let state_str = if paused { "Timer Paused" } else { "Focus Session • In Progress" };
+            let ruler_x = x + 6.0;
+            let ruler_y = y + 2.0;
+            let ruler_w = bw - 12.0;
+            let ruler_h = 50.0;
+            let center_x = ruler_x + ruler_w / 2.0;
 
-            canvas.draw_text(state_str, x + 8.0, y + 10.0, 13.0, Color::WHITE, true);
-            let orange = Color::from_rgba8(240, 160, 100, 255);
-            canvas.draw_text(&time_str, x + 8.0, y + 30.0, 24.0, orange, true);
+            // Track target translation: centers selected tick under cursor
+            let track_x = center_x - (current_mins as f32 * tick_width);
 
-            // Progress bar
-            let bar_y = y + 62.0;
-            let mut bg_bar = Paint::default();
-            bg_bar.set_color_rgba8(255, 255, 255, 30);
-            let mut pb = PathBuilder::new();
-            Self::add_round_rect(&mut pb, x + 8.0, bar_y, bw - 16.0, 4.0, 2.0);
-            if let Some(p) = pb.finish() {
-                canvas.pixmap.fill_path(&p, &bg_bar, tiny_skia::FillRule::Winding, Transform::identity(), None);
-            }
+            // Draw ticks (0 to 60 minutes)
+            for m in 0..=total_minutes {
+                let tick_cx = track_x + (m as f32) * tick_width;
+                if tick_cx < ruler_x - 15.0 || tick_cx > ruler_x + ruler_w + 15.0 {
+                    continue;
+                }
 
-            if total_ms > 0 {
-                let frac = (left_ms as f32 / total_ms as f32).clamp(0.0, 1.0);
-                let mut fg_bar = Paint::default();
-                fg_bar.set_color_rgba8(240, 160, 100, 255);
-                let mut pb = PathBuilder::new();
-                Self::add_round_rect(&mut pb, x + 8.0, bar_y, (bw - 16.0) * frac, 4.0, 2.0);
-                if let Some(p) = pb.finish() {
-                    canvas.pixmap.fill_path(&p, &fg_bar, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                // Mask fade at edges: 18% to 82% visible window (matching MyIsland CSS line 120)
+                let dist_from_center = (tick_cx - center_x).abs();
+                let half_w = ruler_w / 2.0;
+                let edge_dist = half_w - dist_from_center;
+                let fade = (edge_dist / (half_w * 0.36)).clamp(0.0, 1.0);
+                if fade <= 0.01 {
+                    continue;
+                }
+
+                let is_major = m % 5 == 0;
+                let is_selected = m == current_mins;
+
+                if is_selected {
+                    // Selected tick: glowing bold amber bar (MyIsland line 138: 3.2px wide, 28px tall, margin-top 8px)
+                    let bar_w = 3.2f32;
+                    let bar_h = 28.0f32;
+                    let bar_top = ruler_y + 8.0;
+
+                    // Glow behind
+                    let mut glow_paint = Paint::default();
+                    glow_paint.anti_alias = true;
+                    glow_paint.set_color_rgba8(240, 160, 100, (110.0 * fade) as u8);
+                    let mut pb_glow = PathBuilder::new();
+                    Self::add_round_rect(&mut pb_glow, tick_cx - 3.0, bar_top - 2.0, 6.0, bar_h + 4.0, 2.5);
+                    if let Some(p) = pb_glow.finish() {
+                        canvas.pixmap.fill_path(&p, &glow_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                    }
+
+                    let mut bar_paint = Paint::default();
+                    bar_paint.anti_alias = true;
+                    bar_paint.set_color_rgba8(240, 160, 100, (255.0 * fade) as u8);
+                    let mut pb = PathBuilder::new();
+                    Self::add_round_rect(&mut pb, tick_cx - bar_w / 2.0, bar_top, bar_w, bar_h, 1.2);
+                    if let Some(p) = pb.finish() {
+                        canvas.pixmap.fill_path(&p, &bar_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                    }
+                } else if is_major {
+                    // Major tick: 3px wide, 25px tall, margin-top 11px, alpha 0.72 (MyIsland line 135)
+                    let bar_w = 3.0f32;
+                    let bar_h = 25.0f32;
+                    let bar_top = ruler_y + 11.0;
+
+                    let mut bar_paint = Paint::default();
+                    bar_paint.anti_alias = true;
+                    bar_paint.set_color_rgba8(240, 160, 100, (184.0 * fade) as u8);
+                    let mut pb = PathBuilder::new();
+                    Self::add_round_rect(&mut pb, tick_cx - bar_w / 2.0, bar_top, bar_w, bar_h, 1.2);
+                    if let Some(p) = pb.finish() {
+                        canvas.pixmap.fill_path(&p, &bar_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                    }
+
+                    // Major tick label (e.g. 0, 5, 10... 60)
+                    let lbl = format!("{}", m);
+                    let tw = canvas.measure_text_width(&lbl, 11.0, true);
+                    let lbl_color = Color::from_rgba8(240, 160, 100, (216.0 * fade) as u8);
+                    canvas.draw_text_clipped(
+                        &lbl,
+                        tick_cx - tw / 2.0,
+                        ruler_y + 0.0,
+                        11.0,
+                        lbl_color,
+                        true,
+                        ruler_x,
+                        ruler_x + ruler_w,
+                    );
+                } else {
+                    // Minor tick: 2.5px wide, 17px tall, margin-top 19px, alpha 0.28 (MyIsland line 131)
+                    let bar_w = 2.5f32;
+                    let bar_h = 17.0f32;
+                    let bar_top = ruler_y + 19.0;
+
+                    let mut bar_paint = Paint::default();
+                    bar_paint.anti_alias = true;
+                    bar_paint.set_color_rgba8(240, 160, 100, (71.0 * fade) as u8);
+                    let mut pb = PathBuilder::new();
+                    Self::add_round_rect(&mut pb, tick_cx - bar_w / 2.0, bar_top, bar_w, bar_h, 1.2);
+                    if let Some(p) = pb.finish() {
+                        canvas.pixmap.fill_path(&p, &bar_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                    }
                 }
             }
 
-            // Controls (Pause/Resume & Cancel)
-            let pause_btn_text = if paused { "Resume" } else { "Pause" };
+            // Upward pointing triangular cursor in the center bottom (MyIsland line 145)
+            // width: 12px (6px left, 6px right), height: 7px, bottom: 1px from bottom of ruler
+            let tri_apex_y = ruler_y + ruler_h - 9.0;
+            let tri_base_y = ruler_y + ruler_h - 2.0;
+
+            // Cursor glow
+            let mut cursor_glow = Paint::default();
+            cursor_glow.anti_alias = true;
+            cursor_glow.set_color_rgba8(240, 160, 100, 100);
+            let mut pb_cg = PathBuilder::new();
+            pb_cg.move_to(center_x, tri_apex_y - 2.0);
+            pb_cg.line_to(center_x + 8.0, tri_base_y + 1.0);
+            pb_cg.line_to(center_x - 8.0, tri_base_y + 1.0);
+            pb_cg.close();
+            if let Some(p) = pb_cg.finish() {
+                canvas.pixmap.fill_path(&p, &cursor_glow, tiny_skia::FillRule::Winding, Transform::identity(), None);
+            }
+
+            let mut cursor_paint = Paint::default();
+            cursor_paint.anti_alias = true;
+            cursor_paint.set_color_rgba8(240, 160, 100, 255);
+            let mut pb_c = PathBuilder::new();
+            pb_c.move_to(center_x, tri_apex_y);
+            pb_c.line_to(center_x + 6.0, tri_base_y);
+            pb_c.line_to(center_x - 6.0, tri_base_y);
+            pb_c.close();
+            if let Some(p) = pb_c.finish() {
+                canvas.pixmap.fill_path(&p, &cursor_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+            }
+
+            // Setup Footer (MyIsland lines 150-164)
+            let footer_y = ruler_y + ruler_h + 3.0;
+
+            // Start Timer Button (Pill shape, height: 35px, border-radius: 18px)
+            let btn_x = x + 10.0;
+            let btn_y = footer_y;
+            let btn_w = 126.0;
+            let btn_h = 35.0;
+            let btn_r = 17.5;
+
+            let is_btn_hover = pointer_x >= btn_x && pointer_x <= btn_x + btn_w && pointer_y >= btn_y && pointer_y <= btn_y + btn_h;
+            let btn_bg_alpha = if is_btn_hover { 71 } else { 46 }; // 0.28 vs 0.18
+
+            let mut btn_paint = Paint::default();
+            btn_paint.anti_alias = true;
+            btn_paint.set_color_rgba8(240, 160, 100, btn_bg_alpha);
+            let mut pb_btn = PathBuilder::new();
+            Self::add_round_rect(&mut pb_btn, btn_x, btn_y, btn_w, btn_h, btn_r);
+            if let Some(p) = pb_btn.finish() {
+                canvas.pixmap.fill_path(&p, &btn_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+            }
+
+            let btn_text = "Start Timer";
+            let btn_text_w = canvas.measure_text_width(btn_text, 13.5, true);
             canvas.draw_text(
-                pause_btn_text,
-                x + bw - 110.0,
-                y + 22.0,
-                12.0,
-                Color::from_rgba8(255, 255, 255, 200),
+                btn_text,
+                btn_x + (btn_w - btn_text_w) / 2.0,
+                btn_y + 10.0,
+                13.5,
+                orange,
                 true,
             );
+
+            // Right side: Large Time Preview (32px tabular light font)
+            let preview_str = format!("{:02}:00", current_mins);
+            let preview_w = canvas.measure_text_width(&preview_str, 32.0, false);
             canvas.draw_text(
-                "Cancel",
-                x + bw - 45.0,
-                y + 22.0,
-                12.0,
-                Color::from_rgba8(255, 69, 58, 255),
+                &preview_str,
+                x + bw - 12.0 - preview_w,
+                btn_y - 2.0,
+                32.0,
+                orange,
+                false,
+            );
+        } else {
+            // Running View (Premium Stopwatch/Timer Style - MyIsland lines 2590-2624)
+            let done_at = {
+                let end_local = chrono::Local::now() + chrono::Duration::milliseconds(left_ms as i64);
+                end_local.format("%I:%M %p").to_string()
+            };
+
+            let info_x = x + 10.0;
+            let info_w = bw - 158.0;
+
+            // Row 1: Header (Clock SVG icon + Status Text)
+            // 13x13 clock icon matching MyIsland SVG line 2600
+            let icon_cx = info_x + 6.0;
+            let icon_cy = y + 10.0;
+            let icon_r = 5.0;
+            let mut icon_paint = Paint::default();
+            icon_paint.anti_alias = true;
+            icon_paint.set_color_rgba8(240, 160, 100, 255);
+
+            let stroke_icon = Stroke { width: 1.8, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+            let mut pb_clock = PathBuilder::new();
+            pb_clock.push_circle(icon_cx, icon_cy, icon_r);
+            pb_clock.move_to(icon_cx, icon_cy);
+            pb_clock.line_to(icon_cx, icon_cy - 3.2);
+            pb_clock.move_to(icon_cx, icon_cy);
+            pb_clock.line_to(icon_cx + 2.6, icon_cy + 1.2);
+            if let Some(p) = pb_clock.finish() {
+                canvas.pixmap.stroke_path(&p, &icon_paint, &stroke_icon, Transform::identity(), None);
+            }
+
+            let status_prefix = if paused { "TIMER PAUSED" } else { "FOCUS SESSION" };
+            let header_str = format!("{} · ENDS AT {}", status_prefix, done_at);
+            let gray_header = Color::from_rgba8(142, 142, 147, 255); // #8e8e93
+            canvas.draw_text(&header_str, info_x + 18.0, y + 4.0, 11.0, gray_header, true);
+
+            // Row 2: Large Countdown Timer (38px font)
+            let time_str = crate::ui::format_focus_timer(left_ms);
+            canvas.draw_text(&time_str, info_x, y + 20.0, 38.0, Color::WHITE, true);
+
+            // Row 3: Progress Bar (4px height, background 0.12, gradient fill + soft glow)
+            let bar_y = y + 70.0;
+            let bar_h = 4.0;
+            let bar_w = info_w;
+
+            let mut bg_paint = Paint::default();
+            bg_paint.anti_alias = true;
+            bg_paint.set_color_rgba8(255, 255, 255, 31); // 0.12
+            let mut pb_bg = PathBuilder::new();
+            Self::add_round_rect(&mut pb_bg, info_x, bar_y, bar_w, bar_h, 2.0);
+            if let Some(p) = pb_bg.finish() {
+                canvas.pixmap.fill_path(&p, &bg_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+            }
+
+            let frac = if total_ms > 0 {
+                (left_ms as f32 / total_ms as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let fill_w = (bar_w * frac).max(if frac > 0.0 { 4.0 } else { 0.0 });
+            if fill_w > 0.0 {
+                // Subtle glow underneath progress
+                let mut glow_bar = Paint::default();
+                glow_bar.anti_alias = true;
+                glow_bar.set_color_rgba8(240, 160, 100, 75);
+                let mut pb_gb = PathBuilder::new();
+                Self::add_round_rect(&mut pb_gb, info_x, bar_y - 1.0, fill_w, bar_h + 2.0, 3.0);
+                if let Some(p) = pb_gb.finish() {
+                    canvas.pixmap.fill_path(&p, &glow_bar, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                }
+
+                let mut fg_paint = Paint::default();
+                fg_paint.anti_alias = true;
+                fg_paint.set_color_rgba8(240, 160, 100, 255);
+                let mut pb_fg = PathBuilder::new();
+                Self::add_round_rect(&mut pb_fg, info_x, bar_y, fill_w, bar_h, 2.0);
+                if let Some(p) = pb_fg.finish() {
+                    canvas.pixmap.fill_path(&p, &fg_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+                }
+            }
+
+            // Right Column: Vertical Action Buttons (Width 120px, Gap 8px, Height 35px each)
+            let btn_x = x + bw - 130.0;
+            let btn_w = 120.0;
+            let btn_h = 35.0;
+            let btn_r = 14.0;
+
+            // 1. Primary Pause / Resume Button
+            let pause_y = y + 7.0;
+            let is_pause_hover = pointer_x >= btn_x && pointer_x <= btn_x + btn_w && pointer_y >= pause_y && pointer_y <= pause_y + btn_h;
+            let pause_alpha = if is_pause_hover { 82 } else { 56 }; // 0.32 vs 0.22
+
+            let mut pause_paint = Paint::default();
+            pause_paint.anti_alias = true;
+            pause_paint.set_color_rgba8(240, 160, 100, pause_alpha);
+            let mut pb_pause = PathBuilder::new();
+            Self::add_round_rect(&mut pb_pause, btn_x, pause_y, btn_w, btn_h, btn_r);
+            if let Some(p) = pb_pause.finish() {
+                canvas.pixmap.fill_path(&p, &pause_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+            }
+
+            let pause_text = if paused { "Resume" } else { "Pause" };
+            let p_w = canvas.measure_text_width(pause_text, 13.0, true);
+            canvas.draw_text(
+                pause_text,
+                btn_x + (btn_w - p_w) / 2.0,
+                pause_y + 10.0,
+                13.0,
+                orange,
+                true,
+            );
+
+            // 2. Secondary Stop Button (#2c2c2e, hover #3a3a3c)
+            let stop_y = y + 50.0;
+            let is_stop_hover = pointer_x >= btn_x && pointer_x <= btn_x + btn_w && pointer_y >= stop_y && pointer_y <= stop_y + btn_h;
+            let stop_col = if is_stop_hover {
+                Color::from_rgba8(58, 58, 60, 255)
+            } else {
+                Color::from_rgba8(44, 44, 46, 255)
+            };
+
+            let mut stop_paint = Paint::default();
+            stop_paint.anti_alias = true;
+            stop_paint.set_color(stop_col);
+            let mut pb_stop = PathBuilder::new();
+            Self::add_round_rect(&mut pb_stop, btn_x, stop_y, btn_w, btn_h, btn_r);
+            if let Some(p) = pb_stop.finish() {
+                canvas.pixmap.fill_path(&p, &stop_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+            }
+
+            let stop_text = "Stop";
+            let s_w = canvas.measure_text_width(stop_text, 13.0, true);
+            canvas.draw_text(
+                stop_text,
+                btn_x + (btn_w - s_w) / 2.0,
+                stop_y + 10.0,
+                13.0,
+                Color::WHITE,
                 true,
             );
         }
