@@ -2,6 +2,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::config::{COMPACT_LYRICS_MAX_W, COMPACT_LYRICS_MIN_W};
+
 #[derive(Debug, Clone)]
 pub struct LyricLine {
     pub t: u64, // milliseconds
@@ -193,8 +195,29 @@ impl LyricsState {
         !self.lines.is_empty() || (self.is_loading && Instant::now() < self.hold_until)
     }
 
+    /// Width for the compact music pill driven by the lyric currently on screen.
+    ///
+    /// Earlier this used the widest line in the whole song, so the pill locked to
+    /// one width for the entire track. Using the active line (and the outgoing
+    /// line during a crossfade) lets the pill breathe between the min and max
+    /// compact widths as each sentence arrives.
     pub fn get_compact_width(&self) -> f32 {
-        (self.widest_px + 120.0).clamp(320.0, 500.0)
+        const CHROME_PX: f32 = 120.0;
+
+        let active = self.get_now_lyric();
+        let mut text_px = 0.0f32;
+        for text in [active.text.as_deref(), active.previous.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let px: f32 = text
+                .chars()
+                .map(|c| if c.is_ascii() { 8.0 } else { 13.5 })
+                .sum();
+            text_px = text_px.max(px);
+        }
+
+        (text_px + CHROME_PX).clamp(COMPACT_LYRICS_MIN_W, COMPACT_LYRICS_MAX_W)
     }
 
     pub fn parse_lrc(lrc: &str) -> Vec<LyricLine> {

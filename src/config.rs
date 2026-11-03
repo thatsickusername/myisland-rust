@@ -22,6 +22,10 @@ pub const DIMS_EXPANDED: IslandDims = IslandDims { w: 520.0, h: 170.0, r: 30.0 }
 pub const DIMS_TUCKED: IslandDims = IslandDims { w: 56.0, h: 4.0, r: 2.0 };
 pub const DIMS_SECONDARY: IslandDims = IslandDims { w: 44.0, h: 36.0, r: 18.0 };
 
+// Compact music pill width range when synced lyrics are visible.
+pub const COMPACT_LYRICS_MIN_W: f32 = 300.0;
+pub const COMPACT_LYRICS_MAX_W: f32 = 500.0;
+
 pub const SECONDARY_GAP: f32 = 28.0;
 
 // Mascot colors
