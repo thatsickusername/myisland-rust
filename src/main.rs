@@ -23,7 +23,7 @@ use render::{
 use tiny_skia::{PathBuilder, Transform};
 use state::{
     fetch_online_artwork, ActivityManager, ActivityType, ClipboardManager, LyricLine, LyricsState,
-    NotificationPayload,
+    NotificationPayload, SportsState,
 };
 use ui::{
     CompactRenderer, ExpandedRenderer, TrayIcon, IDM_QUIT, IDM_TEST_CALL, IDM_TEST_DISCORD,
@@ -332,10 +332,14 @@ fn run_app() -> windows::core::Result<()> {
     let (notif_tx, notif_rx) = crossbeam_channel::unbounded::<NotificationPayload>();
     let (lyrics_tx, lyrics_rx) = crossbeam_channel::unbounded::<(String, Vec<LyricLine>)>();
     let (art_tx, art_rx) = crossbeam_channel::unbounded::<(String, Vec<u8>)>();
+    let (sports_tx, sports_rx) = crossbeam_channel::unbounded::<SportsState>();
 
     let gsmtc = GsmtcService::start(media_tx, window.hwnd.0 as isize)?;
     NotificationService::start(notif_tx.clone(), window.hwnd.0 as isize);
     DeviceService::start(notif_tx, window.hwnd.0 as isize);
+    crate::platform::SportsService::start(sports_tx, "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard".to_string());
+    let mut latest_sports: Option<SportsState> = None;
+    let mut goal_celebration_until: Option<Instant> = None;
 
     let tray = TrayIcon::create(
         window.hwnd,
@@ -643,7 +647,7 @@ fn run_app() -> windows::core::Result<()> {
                             } else {
                                 let dir = if delta < 0 { 1.0 } else { -1.0 };
                                 target_scroll_index += dir;
-                                current_app = (((target_scroll_index.round() as i32 % 4) + 4) % 4) as usize;
+                                current_app = (((target_scroll_index.round() as i32 % 5) + 5) % 5) as usize;
                                 if current_app != 2 && notes_focused {
                                     notes_focused = false;
                                     NOTES_FOCUSED.store(false, Ordering::SeqCst);
@@ -759,6 +763,7 @@ fn run_app() -> windows::core::Result<()> {
                                         let target_app = match sec_act {
                                             Some(ActivityType::Focus) => 3,
                                             Some(ActivityType::Music) => 0,
+                                            Some(ActivityType::Sports) => 4,
                                             _ => 0,
                                         };
                                         current_app = target_app;
@@ -771,6 +776,7 @@ fn run_app() -> windows::core::Result<()> {
                                             let target_app = match primary {
                                                 ActivityType::Focus => 3,
                                                 ActivityType::Music => 0,
+                                                ActivityType::Sports => 4,
                                             };
                                             current_app = target_app;
                                             target_scroll_index = target_app as f32;
@@ -848,11 +854,11 @@ fn run_app() -> windows::core::Result<()> {
                                 }
                                 if let Some(slot) = clicked_slot {
                                     target_scroll_index = slot as f32;
-                                    current_app = (((slot % 4) + 4) % 4) as usize;
+                                    current_app = (((slot % 5) + 5) % 5) as usize;
                                 } else {
                                     let dir = if px > cx { 1.0 } else { -1.0 };
                                     target_scroll_index += dir;
-                                    current_app = (((target_scroll_index.round() as i32 % 4) + 4) % 4) as usize;
+                                    current_app = (((target_scroll_index.round() as i32 % 5) + 5) % 5) as usize;
                                 }
                             } else if current_app == 0 {
                                 let ctl_x = island_x_cur + w_cur - 22.0 - 50.0;
@@ -1203,6 +1209,21 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
+        while let Ok(sports) = sports_rx.try_recv() {
+            is_dirty = true;
+            if let Some(ref prev) = latest_sports {
+                if sports.home_score > prev.home_score || sports.away_score > prev.away_score {
+                    goal_celebration_until = Some(Instant::now() + std::time::Duration::from_secs(5));
+                    particles.launch_confetti((WINDOW_WIDTH as f32) / 2.0, 28.0);
+                    if current_state == IslandState::Rest || current_state == IslandState::Tucked {
+                        current_state = IslandState::Compact;
+                    }
+                }
+            }
+            activity_mgr.update_sports(sports.is_live);
+            latest_sports = Some(sports);
+        }
+
         activity_mgr.check_notification_expiry();
         clipboard_mgr.flush_note_if_needed();
 
@@ -1496,6 +1517,14 @@ fn run_app() -> windows::core::Result<()> {
                 } else {
                     IslandDims { w: 530.0, h: 58.0, r: 29.0 }
                 };
+            }
+        }
+
+        if let Some(until) = goal_celebration_until {
+            if now < until {
+                target_dims = IslandDims { w: 420.0, h: 60.0, r: 30.0 };
+            } else {
+                goal_celebration_until = None;
             }
         }
 
@@ -1949,6 +1978,7 @@ fn run_app() -> windows::core::Result<()> {
                     clip_scroll_progress,
                     &mut target_notes_scroll,
                     notes_scroll_progress,
+                    latest_sports.as_ref(),
                 )
             };
             if anim {
@@ -1983,6 +2013,7 @@ fn run_app() -> windows::core::Result<()> {
                 is_rest,
                 (w_val / DIMS_COMPACT.w).clamp(0.92, 1.08),
                 volume_stretch_spring.value,
+                latest_sports.as_ref(),
             );
             if anim {
                 ui_animating = true;

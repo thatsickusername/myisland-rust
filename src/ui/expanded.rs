@@ -1,9 +1,9 @@
 use crate::platform::MediaState;
 use crate::render::{AlbumArtManager, LayeredCanvas, MascotEngine};
-use crate::state::{clean_title_and_artist, ClipboardManager, LyricsState, NotificationPayload};
+use crate::state::{clean_title_and_artist, ClipboardManager, LyricsState, NotificationPayload, SportsState};
 use tiny_skia::{Color, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
 
-pub const APP_NAMES: [&str; 4] = ["MUSIC", "CLIPBOARD", "NOTES", "FOCUS"];
+pub const APP_NAMES: [&str; 5] = ["MUSIC", "CLIPBOARD", "NOTES", "FOCUS", "MATCHES"];
 
 pub struct ExpandedRenderer;
 
@@ -405,6 +405,7 @@ impl ExpandedRenderer {
         clip_scroll_progress: f32,
         target_notes_scroll: &mut f32,
         notes_scroll_progress: f32,
+        sports: Option<&SportsState>,
     ) -> bool {
         // Faithful to MyIsland index.html line 3598: card content only renders when h > 80.0
         if h <= 80.0 {
@@ -522,6 +523,7 @@ impl ExpandedRenderer {
                 focus_chosen_sec,
                 ruler_visual_mins,
             ),
+            4 => Self::render_sports(canvas, body_x, body_y, body_w, sports, e_text),
             _ => {}
         }
 
@@ -1699,6 +1701,301 @@ impl ExpandedRenderer {
         pb.quad_to(stem_x + 1.4, cy - 4.2, stem_x + 3.0, cy - 1.2);
         if let Some(p) = pb.finish() {
             canvas.pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+
+    fn render_sports(
+        canvas: &mut LayeredCanvas,
+        x: f32,
+        y: f32,
+        bw: f32,
+        sports: Option<&SportsState>,
+        e_text: f32,
+    ) {
+        let text_dy = (1.0 - e_text) * 8.0;
+        let alpha_u8 = (255.0 * e_text) as u8;
+        let muted = Color::from_rgba8(138, 138, 143, (215.0 * e_text) as u8);
+
+        if let Some(match_data) = sports {
+            // Header: quiet section label on the left, a slightly brighter
+            // status group on the right. The status prefix is dimmed so the
+            // kickoff/clock stays the focal point of the row.
+            let header_y = y + 11.0 + text_dy;
+            let section_title = if match_data.is_upcoming {
+                "UPCOMING MATCH"
+            } else if match_data.is_live {
+                "LIVE SPORTS"
+            } else {
+                "FINAL"
+            };
+            let section_size = 10.5;
+            canvas.draw_text(section_title, x + 16.0, header_y, section_size, muted, true);
+            let section_w = canvas.measure_text_width(section_title, section_size, true);
+
+            let prefix = if match_data.is_live {
+                "LIVE"
+            } else if match_data.is_upcoming {
+                "UP NEXT"
+            } else {
+                ""
+            };
+            let detail = match_data.clock.trim().replace(" at ", " · ");
+            let prefix_size = 9.5;
+            let detail_size = 11.5;
+            let group_gap = 6.0;
+            let prefix_w = if prefix.is_empty() {
+                0.0
+            } else {
+                canvas.measure_text_width(prefix, prefix_size, true)
+            };
+            let available = (bw - 32.0 - section_w - 24.0).max(100.0);
+            let detail_max = (available - prefix_w - group_gap).max(70.0);
+            let detail = canvas.truncate_to_width(&detail, detail_max, detail_size, true);
+            let detail_w = canvas.measure_text_width(&detail, detail_size, true);
+            let detail_x = x + bw - 16.0 - detail_w;
+            let prefix_x = detail_x - group_gap - prefix_w;
+
+            // Only show the prefix when it still leaves a clean gap after the
+            // section label; long status text drops it instead of crowding.
+            if !prefix.is_empty() && prefix_x >= x + 16.0 + section_w + 14.0 {
+                canvas.draw_text(
+                    prefix,
+                    prefix_x,
+                    header_y,
+                    prefix_size,
+                    Color::from_rgba8(142, 142, 147, alpha_u8),
+                    true,
+                );
+            }
+            canvas.draw_text(
+                &detail,
+                detail_x,
+                header_y,
+                detail_size,
+                Color::from_rgba8(255, 255, 255, alpha_u8),
+                true,
+            );
+
+            // Arena: logos, team codes, and scores all share one centerline.
+            let arena_cy = y + 57.0 + text_dy;
+            let logo_size = 32.0;
+            let logo_y = arena_cy - logo_size / 2.0;
+            Self::draw_sports_logo(
+                canvas,
+                match_data.home_logo.as_deref(),
+                x + 4.0,
+                logo_y,
+                logo_size,
+                match_data.home_color,
+                e_text,
+            );
+            Self::draw_sports_logo(
+                canvas,
+                match_data.away_logo.as_deref(),
+                x + bw - logo_size - 4.0,
+                logo_y,
+                logo_size,
+                match_data.away_color,
+                e_text,
+            );
+
+            let team_size = 21.0;
+            let team_color = Color::from_rgba8(238, 238, 242, alpha_u8);
+            let logo_gap = 10.0;
+            let home_text_x = x + 4.0 + logo_size + logo_gap;
+            let away_text_right = x + bw - (4.0 + logo_size + logo_gap);
+            let home_text_y = canvas.text_y_for_vertical_center(
+                &match_data.home_team,
+                team_size,
+                true,
+                arena_cy,
+            );
+            let away_text_y = canvas.text_y_for_vertical_center(
+                &match_data.away_team,
+                team_size,
+                true,
+                arena_cy,
+            );
+            canvas.draw_text(
+                &match_data.home_team,
+                home_text_x,
+                home_text_y,
+                team_size,
+                team_color,
+                true,
+            );
+            let away_w = canvas.measure_text_width(&match_data.away_team, team_size, true);
+            canvas.draw_text(
+                &match_data.away_team,
+                away_text_right - away_w,
+                away_text_y,
+                team_size,
+                team_color,
+                true,
+            );
+
+            // Scores are the visual anchor: larger and brighter than the team
+            // codes, with a quiet vector separator between them.
+            let center_x = x + bw / 2.0;
+            let home_score = match_data.home_score.to_string();
+            let away_score = match_data.away_score.to_string();
+            let score_size = 29.0;
+            let home_score_w = canvas.measure_text_width(&home_score, score_size, true);
+            let score_gap = 22.0;
+            let number_color = Color::from_rgba8(255, 255, 255, alpha_u8);
+            let home_score_y =
+                canvas.text_y_for_vertical_center(&home_score, score_size, true, arena_cy);
+            let away_score_y =
+                canvas.text_y_for_vertical_center(&away_score, score_size, true, arena_cy);
+            canvas.draw_text(
+                &home_score,
+                center_x - score_gap - home_score_w,
+                home_score_y,
+                score_size,
+                number_color,
+                true,
+            );
+            canvas.draw_text(
+                &away_score,
+                center_x + score_gap,
+                away_score_y,
+                score_size,
+                number_color,
+                true,
+            );
+
+            // Use a native vector separator instead of a box-drawing glyph;
+            // the latter renders as missing-glyph squares in the bundled font.
+            let mut separator = Paint::default();
+            separator.anti_alias = true;
+            separator.set_color_rgba8(142, 142, 147, (190.0 * e_text) as u8);
+            let mut separator_path = PathBuilder::new();
+            separator_path.move_to(center_x - 6.0, arena_cy);
+            separator_path.line_to(center_x + 6.0, arena_cy);
+            if let Some(path) = separator_path.finish() {
+                canvas.pixmap.stroke_path(
+                    &path,
+                    &separator,
+                    &Stroke {
+                        width: 2.0,
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Default::default()
+                    },
+                    Transform::identity(),
+                    None,
+                );
+            }
+
+            // Keep the optional event note in its own band between the arena
+            // and the tab selector instead of letting it reach the tabs.
+            if let Some(event) = match_data
+                .latest_event
+                .as_deref()
+                .map(str::trim)
+                .filter(|event| !event.is_empty())
+            {
+                let event = canvas.truncate_to_width(event, bw - 32.0, 11.5, false);
+                canvas.draw_text(
+                    &event,
+                    x + 16.0,
+                    y + 86.0 + text_dy,
+                    11.5,
+                    Color::from_rgba8(200, 200, 206, (180.0 * e_text) as u8),
+                    false,
+                );
+            }
+        } else {
+            let empty_str = "No live matches pinned";
+            let ew = canvas.measure_text_width(empty_str, 12.5, false);
+            canvas.draw_text(
+                empty_str,
+                x + (bw - ew) / 2.0,
+                y + 48.0 + text_dy,
+                12.5,
+                muted,
+                false,
+            );
+        }
+    }
+
+    fn draw_sports_logo(
+        canvas: &mut LayeredCanvas,
+        bytes: Option<&[u8]>,
+        x: f32,
+        y: f32,
+        size: f32,
+        team_color: [u8; 4],
+        alpha: f32,
+    ) {
+        let mut background = Paint::default();
+        background.anti_alias = true;
+        background.set_color_rgba8(
+            team_color[0],
+            team_color[1],
+            team_color[2],
+            (205.0 * alpha) as u8,
+        );
+        let mut background_path = PathBuilder::new();
+        Self::add_round_rect(&mut background_path, x, y, size, size, 10.0);
+        if let Some(path) = background_path.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &background,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let Ok(image) = image::load_from_memory(bytes) else {
+            return;
+        };
+        let rgba = image.to_rgba8();
+        let Some(mut pixmap) = Pixmap::new(rgba.width(), rgba.height()) else {
+            return;
+        };
+        for (source, target) in rgba
+            .as_raw()
+            .chunks_exact(4)
+            .zip(pixmap.data_mut().chunks_exact_mut(4))
+        {
+            let image_alpha = source[3] as u16;
+            target[0] = ((source[0] as u16 * image_alpha) / 255) as u8;
+            target[1] = ((source[1] as u16 * image_alpha) / 255) as u8;
+            target[2] = ((source[2] as u16 * image_alpha) / 255) as u8;
+            target[3] = ((source[3] as f32) * alpha) as u8;
+        }
+
+        let inner_size = size - 8.0;
+        let scale = (inner_size / pixmap.width() as f32).min(inner_size / pixmap.height() as f32);
+        let draw_w = pixmap.width() as f32 * scale;
+        let draw_h = pixmap.height() as f32 * scale;
+        let transform = Transform::from_scale(scale, scale).post_translate(
+            x + (size - draw_w) / 2.0,
+            y + (size - draw_h) / 2.0,
+        );
+        let mut logo_paint = Paint::default();
+        logo_paint.anti_alias = true;
+        logo_paint.shader = Pattern::new(
+            pixmap.as_ref(),
+            SpreadMode::Pad,
+            FilterQuality::Bilinear,
+            1.0,
+            transform,
+        );
+        let mut clip = PathBuilder::new();
+        Self::add_round_rect(&mut clip, x + 4.0, y + 4.0, inner_size, inner_size, 7.0);
+        if let Some(path) = clip.finish() {
+            canvas.pixmap.fill_path(
+                &path,
+                &logo_paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
     }
 }

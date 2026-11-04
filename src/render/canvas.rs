@@ -458,6 +458,46 @@ impl LayeredCanvas {
         }
     }
 
+    /// Returns the `y` value to pass to `draw_text` so the glyph ink is
+    /// vertically centered on `center_y`. `draw_text` positions glyphs from
+    /// the top of the font line box, so text of different sizes would
+    /// otherwise sit on different optical centerlines.
+    pub fn text_y_for_vertical_center(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        center_y: f32,
+    ) -> f32 {
+        let font = if bold {
+            self.font_bold.as_ref().or(self.font_regular.as_ref())
+        } else {
+            self.font_regular.as_ref()
+        };
+        let Some(font) = font else {
+            return center_y - size * 0.5;
+        };
+
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for ch in text.chars() {
+            let metrics = font.metrics(ch, size);
+            if metrics.height == 0 {
+                continue;
+            }
+            let glyph_top = size - metrics.ymin as f32 - metrics.height as f32;
+            let glyph_bottom = size - metrics.ymin as f32;
+            top = top.min(glyph_top);
+            bottom = bottom.max(glyph_bottom);
+        }
+
+        if top.is_finite() && bottom.is_finite() {
+            center_y - (top + bottom) * 0.5
+        } else {
+            center_y - size * 0.5
+        }
+    }
+
     pub fn truncate_to_width(
         &self,
         text: &str,

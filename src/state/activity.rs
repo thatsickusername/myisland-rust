@@ -4,6 +4,23 @@ use std::time::Instant;
 pub enum ActivityType {
     Music,
     Focus,
+    Sports,
+}
+
+#[derive(Debug, Clone)]
+pub struct SportsState {
+    pub home_team: String,
+    pub home_score: u32,
+    pub home_color: [u8; 4],
+    pub home_logo: Option<Vec<u8>>,
+    pub away_team: String,
+    pub away_score: u32,
+    pub away_color: [u8; 4],
+    pub away_logo: Option<Vec<u8>>,
+    pub clock: String,
+    pub is_live: bool,
+    pub is_upcoming: bool,
+    pub latest_event: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -68,6 +85,16 @@ impl ActivityManager {
             }
         } else {
             self.stack.retain(|a| *a != ActivityType::Focus);
+        }
+    }
+
+    pub fn update_sports(&mut self, is_live: bool) {
+        if is_live {
+            if !self.stack.contains(&ActivityType::Sports) {
+                self.stack.push(ActivityType::Sports);
+            }
+        } else {
+            self.stack.retain(|a| *a != ActivityType::Sports);
         }
     }
 

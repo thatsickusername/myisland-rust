@@ -1,5 +1,5 @@
 use crate::render::{AlbumArtManager, LayeredCanvas, MascotEngine, Visualizer};
-use crate::state::{ActivityType, LyricsState, NotificationPayload};
+use crate::state::{ActivityType, LyricsState, NotificationPayload, SportsState};
 use tiny_skia::{Color, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
 
 pub struct CompactRenderer;
@@ -32,6 +32,7 @@ impl CompactRenderer {
         is_rest: bool,
         content_scale: f32,
         volume_stretch: f32,
+        sports: Option<&SportsState>,
     ) -> bool {
         let cy = h / 2.0;
         let left = island_x + 14.0;
@@ -472,6 +473,81 @@ impl CompactRenderer {
             let orange = Color::from_rgba8(240, 160, 100, 255);
             let tw = canvas.measure_text_width(&time_str, 13.0, true);
             canvas.draw_text(&time_str, right - tw, cy - 7.0, 13.0, orange, true);
+        } else if primary_activity == Some(ActivityType::Sports) && !is_rest {
+            // ==========================================
+            // Sports Live Pill (Compact)
+            // ==========================================
+            if let Some(match_data) = sports {
+                let text_color = Color::WHITE;
+                let home_color = Color::from_rgba8(
+                    match_data.home_color[0],
+                    match_data.home_color[1],
+                    match_data.home_color[2],
+                    255,
+                );
+                let away_color = Color::from_rgba8(
+                    match_data.away_color[0],
+                    match_data.away_color[1],
+                    match_data.away_color[2],
+                    255,
+                );
+
+                let mut home_dot = Paint::default();
+                home_dot.anti_alias = true;
+                home_dot.set_color(home_color);
+                let mut home_path = PathBuilder::new();
+                home_path.push_circle(left + 1.0, cy, 3.5);
+                if let Some(path) = home_path.finish() {
+                    canvas.pixmap.fill_path(
+                        &path,
+                        &home_dot,
+                        tiny_skia::FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+
+                // Leading: Home team & Score
+                let home_str = format!("{} {}", match_data.home_team, match_data.home_score);
+                let home_w = canvas.measure_text_width(&home_str, 13.5, true);
+                canvas.draw_text(&home_str, left + 9.0, cy - 7.0, 13.5, text_color, true);
+
+                // Trailing: Away score & Team
+                let away_str = format!("{} {}", match_data.away_score, match_data.away_team);
+                let away_w = canvas.measure_text_width(&away_str, 13.5, true);
+                let away_x = right - away_w - 9.0;
+
+                // Center: live clock / kickoff, constrained to the space left
+                // between the two team blocks so it can never overlap them.
+                let center_str = if match_data.is_live {
+                    format!("{} 🟢", match_data.clock)
+                } else {
+                    match_data.clock.trim().replace(" at ", " · ")
+                };
+                let center_left = left + 9.0 + home_w + 14.0;
+                let center_right = away_x - 14.0;
+                let center_max = (center_right - center_left).max(0.0);
+                let center_str = canvas.truncate_to_width(&center_str, center_max, 12.0, false);
+                let center_w = canvas.measure_text_width(&center_str, 12.0, false);
+                let center_x = (center_left + center_right) / 2.0 - center_w / 2.0;
+                canvas.draw_text(&center_str, center_x, cy - 6.0, 12.0, Color::from_rgba8(235, 235, 245, 185), false);
+
+                let mut away_dot = Paint::default();
+                away_dot.anti_alias = true;
+                away_dot.set_color(away_color);
+                let mut away_path = PathBuilder::new();
+                away_path.push_circle(away_x - 5.0, cy, 3.5);
+                if let Some(path) = away_path.finish() {
+                    canvas.pixmap.fill_path(
+                        &path,
+                        &away_dot,
+                        tiny_skia::FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+                canvas.draw_text(&away_str, away_x, cy - 7.0, 13.5, text_color, true);
+            }
         } else {
             // ==========================================
             // Standard Compact Mode (Idle / Hovered) - MyIsland lines 3544-3572
