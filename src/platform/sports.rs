@@ -53,10 +53,8 @@ enum PollPhase {
     Dormant,
     /// Today's match is finished.
     Final,
-    /// Match is scheduled later (possibly days away).
-    Scheduled,
-    /// Kickoff is within the hour.
-    UpcomingSoon,
+    /// Match is scheduled in the future. Holds the UNIX timestamp of kickoff.
+    Scheduled(i64),
     /// Match is in progress.
     Live,
 }
@@ -66,11 +64,20 @@ impl PollPhase {
         match self {
             // Aggressive only while the ball is actually in play.
             PollPhase::Live => Duration::from_secs(15),
-            // Close to kickoff: refresh once a minute so the transition to
-            // Live is caught quickly.
-            PollPhase::UpcomingSoon => Duration::from_secs(60),
+            // Sleep exactly until the kickoff + 5 seconds to catch the state
+            // transition instantly without hammering the API beforehand.
+            PollPhase::Scheduled(kickoff_ts) => {
+                let now = chrono::Utc::now().timestamp();
+                if kickoff_ts > now {
+                    let wait_secs = (kickoff_ts - now + 5) as u64;
+                    Duration::from_secs(wait_secs).min(Duration::from_secs(12 * 60 * 60))
+                } else {
+                    // Fallback polling if we missed it or the API state lags.
+                    Duration::from_secs(60)
+                }
+            }
             // Pre/post: no need to check more than every five minutes.
-            PollPhase::Scheduled | PollPhase::Final => Duration::from_secs(5 * 60),
+            PollPhase::Final => Duration::from_secs(5 * 60),
             // Nothing today: resolve the active competition again tomorrow.
             PollPhase::Dormant => Duration::from_secs(12 * 60 * 60),
             PollPhase::Error => Duration::from_secs(5 * 60),
@@ -82,8 +89,7 @@ impl PollPhase {
             PollPhase::Error => 0,
             PollPhase::Dormant => 1,
             PollPhase::Final => 2,
-            PollPhase::Scheduled => 3,
-            PollPhase::UpcomingSoon => 4,
+            PollPhase::Scheduled(_) => 4,
             PollPhase::Live => 5,
         }
     }
@@ -297,15 +303,9 @@ impl SportsService {
 
             let phase = match state {
                 "in" => PollPhase::Live,
-                "pre" => {
-                    if Self::starts_within_an_hour(event) {
-                        PollPhase::UpcomingSoon
-                    } else {
-                        PollPhase::Scheduled
-                    }
-                }
+                "pre" => PollPhase::Scheduled(Self::kickoff_timestamp(event)),
                 "post" => PollPhase::Final,
-                _ => PollPhase::Scheduled,
+                _ => PollPhase::Scheduled(Self::kickoff_timestamp(event)),
             };
 
             if phase.rank() > best.rank() {
@@ -316,15 +316,15 @@ impl SportsService {
         best
     }
 
-    fn starts_within_an_hour(event: &Value) -> bool {
-        let Some(date) = event.get("date").and_then(Value::as_str) else {
-            return false;
-        };
-        let Ok(kickoff) = chrono::DateTime::parse_from_rfc3339(date) else {
-            return false;
-        };
-        let seconds_until = (kickoff.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
-        (-3600..=3600).contains(&seconds_until)
+    /// Resolve the exact RFC 3339 kickoff timestamp for an event. Missing or
+    /// malformed dates fall back to a short re-check instead of a long sleep.
+    fn kickoff_timestamp(event: &Value) -> i64 {
+        event
+            .get("date")
+            .and_then(Value::as_str)
+            .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+            .map(|kickoff| kickoff.with_timezone(&chrono::Utc).timestamp())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() + 300)
     }
 
     fn parse_scoreboard(json: &Value, target_abbr: &str) -> Option<ParsedSports> {
@@ -363,7 +363,7 @@ impl SportsService {
             .unwrap_or("");
         let is_live = state == "in";
         let is_upcoming = state == "pre";
-        let clock = if is_upcoming {
+        let raw_clock = if is_upcoming {
             Self::scheduled_label(event, status_type)
         } else {
             status
@@ -374,6 +374,16 @@ impl SportsService {
                 .unwrap_or("")
                 .to_string()
         };
+
+        // Sanitize stray ESPN Unicode blocks (blinking squares, red cards,
+        // emoji markers) that the UI font cannot rasterize. Keep the ASCII
+        // range plus the middle dot used by the scheduled label.
+        let clock = raw_clock
+            .chars()
+            .filter(|&c| c.is_ascii() || c == '\u{00B7}')
+            .collect::<String>()
+            .trim()
+            .to_string();
 
         Some(ParsedSports {
             state: SportsState {
@@ -662,8 +672,10 @@ mod tests {
     #[test]
     fn live_phase_polls_fastest_and_dormant_phase_sleeps_longest() {
         assert_eq!(PollPhase::Live.interval().as_secs(), 15);
-        assert_eq!(PollPhase::UpcomingSoon.interval().as_secs(), 60);
-        assert_eq!(PollPhase::Scheduled.interval().as_secs(), 300);
+        let future = chrono::Utc::now().timestamp() + 3600;
+        let scheduled = PollPhase::Scheduled(future);
+        assert!(scheduled.interval().as_secs() > 3000);
+        assert_eq!(PollPhase::Final.interval().as_secs(), 300);
         assert_eq!(PollPhase::Dormant.interval().as_secs(), 12 * 60 * 60);
     }
 }

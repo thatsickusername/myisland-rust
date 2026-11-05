@@ -1948,7 +1948,7 @@ impl ExpandedRenderer {
 
         // Arena: logos, team codes, and scores all share one centerline.
         let arena_cy = y + 57.0;
-        let logo_size = 32.0;
+        let logo_size = 50.0; // Increased from 32.0
         let logo_y = arena_cy - logo_size / 2.0;
         Self::draw_sports_logo(
             canvas,
@@ -1956,7 +1956,6 @@ impl ExpandedRenderer {
             x + 4.0,
             logo_y,
             logo_size,
-            match_data.home_color,
             e_text,
             mask,
         );
@@ -1966,7 +1965,6 @@ impl ExpandedRenderer {
             x + bw - logo_size - 4.0,
             logo_y,
             logo_size,
-            match_data.away_color,
             e_text,
             mask,
         );
@@ -2143,37 +2141,22 @@ impl ExpandedRenderer {
         x: f32,
         y: f32,
         size: f32,
-        team_color: [u8; 4],
         alpha: f32,
         mask: Option<&Mask>,
     ) {
-        let mut background = Paint::default();
-        background.anti_alias = true;
-        background.set_color_rgba8(
-            team_color[0],
-            team_color[1],
-            team_color[2],
-            (205.0 * alpha) as u8,
-        );
-        let mut background_path = PathBuilder::new();
-        Self::add_round_rect(&mut background_path, x, y, size, size, 10.0);
-        if let Some(path) = background_path.finish() {
-            canvas.pixmap.fill_path(
-                &path,
-                &background,
-                tiny_skia::FillRule::Winding,
-                Transform::identity(),
-                mask,
-            );
-        }
-
         let Some(bytes) = bytes else {
             return;
         };
         let Ok(image) = image::load_from_memory(bytes) else {
             return;
         };
-        let rgba = image.to_rgba8();
+
+        // High-quality downscale before handing off to tiny-skia's shader.
+        // This avoids missing-pixel aliasing caused by lack of mipmapping.
+        let target_px = size.ceil() as u32;
+        let resized = image.resize(target_px, target_px, image::imageops::FilterType::Lanczos3);
+        let rgba = resized.to_rgba8();
+
         let Some(mut pixmap) = Pixmap::new(rgba.width(), rgba.height()) else {
             return;
         };
@@ -2189,25 +2172,26 @@ impl ExpandedRenderer {
             target[3] = ((source[3] as f32) * alpha) as u8;
         }
 
-        let inner_size = size - 8.0;
-        let scale = (inner_size / pixmap.width() as f32).min(inner_size / pixmap.height() as f32);
+        let scale = (size / pixmap.width() as f32).min(size / pixmap.height() as f32);
         let draw_w = pixmap.width() as f32 * scale;
         let draw_h = pixmap.height() as f32 * scale;
         let transform = Transform::from_scale(scale, scale).post_translate(
             x + (size - draw_w) / 2.0,
             y + (size - draw_h) / 2.0,
         );
+
         let mut logo_paint = Paint::default();
         logo_paint.anti_alias = true;
         logo_paint.shader = Pattern::new(
             pixmap.as_ref(),
             SpreadMode::Pad,
-            FilterQuality::Bilinear,
+            FilterQuality::Bicubic, // Upgraded to Bicubic for smoother downscaling
             1.0,
             transform,
         );
+
         let mut clip = PathBuilder::new();
-        Self::add_round_rect(&mut clip, x + 4.0, y + 4.0, inner_size, inner_size, 7.0);
+        Self::add_round_rect(&mut clip, x, y, size, size, 7.0);
         if let Some(path) = clip.finish() {
             canvas.pixmap.fill_path(
                 &path,

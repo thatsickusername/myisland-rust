@@ -1,6 +1,14 @@
 use crate::render::{AlbumArtManager, LayeredCanvas, MascotEngine, Visualizer};
 use crate::state::{ActivityType, LyricsState, NotificationPayload, SportsState};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use tiny_skia::{Color, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
+
+thread_local! {
+    // Statically caches decoded sports team logos on the UI thread so a PNG
+    // is parsed at most once per session instead of on every 60fps frame.
+    static SPORTS_LOGO_CACHE: RefCell<HashMap<String, Pixmap>> = RefCell::new(HashMap::new());
+}
 
 pub struct CompactRenderer;
 
@@ -481,74 +489,104 @@ impl CompactRenderer {
             // ==========================================
             if let Some(match_data) = sports {
                 let text_color = Color::WHITE;
-                let home_color = Color::from_rgba8(
-                    match_data.home_color[0],
-                    match_data.home_color[1],
-                    match_data.home_color[2],
-                    255,
-                );
-                let away_color = Color::from_rgba8(
-                    match_data.away_color[0],
-                    match_data.away_color[1],
-                    match_data.away_color[2],
-                    255,
-                );
+                let cs = h - 12.0; // matching the music cover art dimensions
 
-                let mut home_dot = Paint::default();
-                home_dot.anti_alias = true;
-                home_dot.set_color(home_color);
-                let mut home_path = PathBuilder::new();
-                home_path.push_circle(left + 1.0, cy, 3.5);
-                if let Some(path) = home_path.finish() {
-                    canvas.pixmap.fill_path(
-                        &path,
-                        &home_dot,
-                        tiny_skia::FillRule::Winding,
-                        Transform::identity(),
-                        None,
+                // Leading: home logo at the left bound.
+                let home_logo_x = left - 4.0;
+                let home_logo_y = cy - cs / 2.0;
+                if let Some(bytes) = &match_data.home_logo {
+                    Self::draw_cached_sports_logo(
+                        canvas,
+                        &match_data.home_team,
+                        bytes,
+                        home_logo_x,
+                        home_logo_y,
+                        cs,
+                        7.0,
                     );
                 }
 
-                // Leading: Home team & Score
+                // Trailing: away logo at the right bound.
+                let away_logo_x = right - cs + 4.0;
+                let away_logo_y = cy - cs / 2.0;
+                if let Some(bytes) = &match_data.away_logo {
+                    Self::draw_cached_sports_logo(
+                        canvas,
+                        &match_data.away_team,
+                        bytes,
+                        away_logo_x,
+                        away_logo_y,
+                        cs,
+                        7.0,
+                    );
+                }
+
+                // Home team & score, directly after the logo.
                 let home_str = format!("{} {}", match_data.home_team, match_data.home_score);
                 let home_w = canvas.measure_text_width(&home_str, 13.5, true);
-                canvas.draw_text(&home_str, left + 9.0, cy - 7.0, 13.5, text_color, true);
+                canvas.draw_text(
+                    &home_str,
+                    home_logo_x + cs + 8.0,
+                    cy - 7.0,
+                    13.5,
+                    text_color,
+                    true,
+                );
 
-                // Trailing: Away score & Team
+                // Away score & team, directly before the logo.
                 let away_str = format!("{} {}", match_data.away_score, match_data.away_team);
                 let away_w = canvas.measure_text_width(&away_str, 13.5, true);
-                let away_x = right - away_w - 9.0;
+                let away_x = away_logo_x - away_w - 8.0;
+                canvas.draw_text(&away_str, away_x, cy - 7.0, 13.5, text_color, true);
 
-                // Center: live clock / kickoff, constrained to the space left
-                // between the two team blocks so it can never overlap them.
+                // Center: live clock / kickoff, constrained to the gap between
+                // the team blocks so it can never overlap them.
                 let center_str = if match_data.is_live {
-                    format!("{} 🟢", match_data.clock)
+                    match_data.clock.clone()
                 } else {
                     match_data.clock.trim().replace(" at ", " \u{00B7} ")
                 };
-                let center_left = left + 9.0 + home_w + 14.0;
+
+                let center_left = home_logo_x + cs + 8.0 + home_w + 14.0;
                 let center_right = away_x - 14.0;
                 let center_max = (center_right - center_left).max(0.0);
+
                 let center_str = canvas.truncate_to_width(&center_str, center_max, 12.0, false);
                 let center_w = canvas.measure_text_width(&center_str, 12.0, false);
-                let center_x = (center_left + center_right) / 2.0 - center_w / 2.0;
-                canvas.draw_text(&center_str, center_x, cy - 6.0, 12.0, Color::from_rgba8(235, 235, 245, 185), false);
 
-                let mut away_dot = Paint::default();
-                away_dot.anti_alias = true;
-                away_dot.set_color(away_color);
-                let mut away_path = PathBuilder::new();
-                away_path.push_circle(away_x - 5.0, cy, 3.5);
-                if let Some(path) = away_path.finish() {
-                    canvas.pixmap.fill_path(
-                        &path,
-                        &away_dot,
-                        tiny_skia::FillRule::Winding,
-                        Transform::identity(),
-                        None,
-                    );
+                let total_center_w = if match_data.is_live {
+                    center_w + 12.0
+                } else {
+                    center_w
+                };
+                let center_start_x = (center_left + center_right) / 2.0 - total_center_w / 2.0;
+
+                canvas.draw_text(
+                    &center_str,
+                    center_start_x,
+                    cy - 6.0,
+                    12.0,
+                    Color::from_rgba8(235, 235, 245, 185),
+                    false,
+                );
+
+                // Vector replacement for the unsupported emoji status marker.
+                if match_data.is_live {
+                    let mut dot_paint = Paint::default();
+                    dot_paint.anti_alias = true;
+                    dot_paint.set_color_rgba8(48, 209, 88, 255); // Apple emerald #30d158
+                    let mut dot_path = PathBuilder::new();
+                    dot_path.push_circle(center_start_x + center_w + 8.0, cy, 3.5);
+                    if let Some(path) = dot_path.finish() {
+                        canvas.pixmap.fill_path(
+                            &path,
+                            &dot_paint,
+                            tiny_skia::FillRule::Winding,
+                            Transform::identity(),
+                            None,
+                        );
+                    }
                 }
-                canvas.draw_text(&away_str, away_x, cy - 7.0, 13.5, text_color, true);
             }
         } else {
             // ==========================================
@@ -603,6 +641,96 @@ impl CompactRenderer {
         }
 
         is_animating
+    }
+
+    /// Cache a decoded, premultiplied team logo and draw it clipped to the
+    /// same rounded-rectangle treatment used by the album-art thumbnail.
+    fn draw_cached_sports_logo(
+        canvas: &mut LayeredCanvas,
+        team_abbr: &str,
+        bytes: &[u8],
+        x: f32,
+        y: f32,
+        size: f32,
+        radius: f32,
+    ) {
+        SPORTS_LOGO_CACHE.with(|cache_cell| {
+            let mut cache = cache_cell.borrow_mut();
+            let pixmap = cache.entry(team_abbr.to_string()).or_insert_with(|| {
+                let Ok(image) = image::load_from_memory(bytes) else {
+                    return Pixmap::new(1, 1).unwrap();
+                };
+
+                // High-quality downscale before rasterizing into the pixmap cache.
+                // Reduces memory footprint and entirely prevents scale aliasing.
+                let target_px = size.ceil() as u32;
+                let resized = image.resize(target_px, target_px, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
+
+                let Some(mut pixmap) = Pixmap::new(rgba.width(), rgba.height()) else {
+                    return Pixmap::new(1, 1).unwrap();
+                };
+                for (source, target) in rgba
+                    .as_raw()
+                    .chunks_exact(4)
+                    .zip(pixmap.data_mut().chunks_exact_mut(4))
+                {
+                    let alpha = source[3] as u16;
+                    target[0] = ((source[0] as u16 * alpha) / 255) as u8;
+                    target[1] = ((source[1] as u16 * alpha) / 255) as u8;
+                    target[2] = ((source[2] as u16 * alpha) / 255) as u8;
+                    target[3] = source[3];
+                }
+                pixmap
+            });
+
+            if pixmap.width() <= 1 || pixmap.height() <= 1 {
+                return;
+            }
+
+            let image_w = pixmap.width() as f32;
+            let image_h = pixmap.height() as f32;
+            let scale = (size / image_w).min(size / image_h);
+            let draw_w = image_w * scale;
+            let draw_h = image_h * scale;
+            let tx = x + (size - draw_w) / 2.0;
+            let ty = y + (size - draw_h) / 2.0;
+
+            let transform = Transform::from_scale(scale, scale).post_translate(tx, ty);
+            let mut paint = Paint::default();
+            paint.anti_alias = true;
+            paint.shader = Pattern::new(
+                pixmap.as_ref(),
+                SpreadMode::Pad,
+                FilterQuality::Bicubic, // Upgraded to Bicubic
+                1.0,
+                transform,
+            );
+
+            let mut pb = PathBuilder::new();
+            let rx = radius.min(draw_w / 2.0);
+            let ry = radius.min(draw_h / 2.0);
+            pb.move_to(tx + rx, ty);
+            pb.line_to(tx + draw_w - rx, ty);
+            pb.quad_to(tx + draw_w, ty, tx + draw_w, ty + ry);
+            pb.line_to(tx + draw_w, ty + draw_h - ry);
+            pb.quad_to(tx + draw_w, ty + draw_h, tx + draw_w - rx, ty + draw_h);
+            pb.line_to(tx + rx, ty + draw_h);
+            pb.quad_to(tx, ty + draw_h, tx, ty + draw_h - ry);
+            pb.line_to(tx, ty + ry);
+            pb.quad_to(tx, ty, tx + rx, ty);
+            pb.close();
+
+            if let Some(path) = pb.finish() {
+                canvas.pixmap.fill_path(
+                    &path,
+                    &paint,
+                    tiny_skia::FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        });
     }
 
     fn draw_center_copied_badge(
