@@ -219,7 +219,6 @@ impl CompactRenderer {
 
             let bar_h = 5.0;
             let bar_y = cy - bar_h / 2.0;
-            // The bar width is now cohesively locked to the physical island width 'w'
             let bar_w = (w - 92.0).max(10.0);
             let bar_x = island_x + (w - bar_w) / 2.0;
 
@@ -263,6 +262,30 @@ impl CompactRenderer {
             // Volume number
             let num_text = if is_muted { "0".to_string() } else { format!("{}", volume.round() as i32) };
             canvas.draw_text(&num_text, right_vol_x - 8.0, cy - 4.0, 12.0, Color::WHITE, true);
+            
+        } else if is_showing_copied && copied_alpha > 0.01 {
+            // ==========================================
+            // Copied Confirmation View
+            // ==========================================
+            let cx = island_x + w / 2.0;
+            Self::draw_center_copied_badge(canvas, cx, cy, copied_alpha);
+            is_animating = true;
+            if copied_alpha < 0.99 {
+                let animating = mascot.update_and_draw(
+                    &mut canvas.pixmap.as_mut(),
+                    cx,
+                    cy,
+                    (1.0 - copied_alpha).clamp(0.0, 1.0) * content_scale,
+                    pointer_x,
+                    pointer_y,
+                    is_music_playing,
+                    is_focus_running,
+                    is_rest,
+                );
+                if animating {
+                    is_animating = true;
+                }
+            }
         } else if primary_activity == Some(ActivityType::Music) {
             // ==========================================
             // Music Compact View (Album Art + Lyric/Eyes + Visualizer)
@@ -350,40 +373,19 @@ impl CompactRenderer {
 
             if !drew_lyrics {
                 let cx = island_x + w / 2.0;
-                if is_showing_copied && copied_alpha > 0.01 {
-                    Self::draw_center_copied_badge(canvas, cx, cy, copied_alpha);
+                let animating = mascot.update_and_draw(
+                    &mut canvas.pixmap.as_mut(),
+                    cx,
+                    cy,
+                    1.0 * content_scale,
+                    pointer_x,
+                    pointer_y,
+                    is_music_playing,
+                    is_focus_running,
+                    is_rest,
+                );
+                if animating {
                     is_animating = true;
-                    if copied_alpha < 0.99 {
-                        let animating = mascot.update_and_draw(
-                            &mut canvas.pixmap.as_mut(),
-                            cx,
-                            cy,
-                            (1.0 - copied_alpha).clamp(0.0, 1.0) * content_scale,
-                            pointer_x,
-                            pointer_y,
-                            is_music_playing,
-                            is_focus_running,
-                            is_rest,
-                        );
-                        if animating {
-                            is_animating = true;
-                        }
-                    }
-                } else {
-                    let animating = mascot.update_and_draw(
-                        &mut canvas.pixmap.as_mut(),
-                        cx,
-                        cy,
-                        1.0 * content_scale,
-                        pointer_x,
-                        pointer_y,
-                        is_music_playing,
-                        is_focus_running,
-                        is_rest,
-                    );
-                    if animating {
-                        is_animating = true;
-                    }
                 }
             }
 

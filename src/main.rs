@@ -1262,6 +1262,15 @@ fn run_app() -> windows::core::Result<()> {
             is_dirty = true;
         }
 
+        // INSERT THE EXPIRATION CHECK HERE
+        if let Some(until) = clip_copied_banner_until {
+            if Instant::now() >= until {
+                clip_copied_banner_until = None;
+                clip_copied_index = None;
+                is_dirty = true; 
+            }
+        }
+
         let extrapolated_progress = if latest_media.is_playing {
             let p = current_progress_base + progress_anchor_time.elapsed().as_millis() as u64;
             if latest_media.duration_ms > 0 {
@@ -1513,8 +1522,12 @@ fn run_app() -> windows::core::Result<()> {
             IslandState::Compact => {
                 let (primary, _) = activity_mgr.get_activities();
                 let mut w = DIMS_COMPACT.w;
+                let is_showing_copied = clip_copied_banner_until.map_or(false, |until| now < until);
+
                 if is_volume_hud_active {
                     w = 300.0;
+                } else if is_showing_copied {
+                    w = DIMS_COMPACT.w; // Snaps back to standard width temporarily to show the banner
                 } else if primary == Some(ActivityType::Music) && lyrics.has_lyrics() {
                     w = lyrics.get_compact_width();
                 } else if primary == Some(ActivityType::Focus) {
@@ -1945,13 +1958,6 @@ fn run_app() -> windows::core::Result<()> {
         let mut render_media = latest_media.clone();
         render_media.progress_ms = extrapolated_progress;
 
-        if let Some(until) = clip_copied_banner_until {
-            if now >= until {
-                clip_copied_banner_until = None;
-                clip_copied_index = None;
-            }
-        }
-
         let cursor_moved = notes_cursor_pos != prev_notes_cursor_pos;
         prev_notes_cursor_pos = notes_cursor_pos;
 
@@ -2130,6 +2136,7 @@ fn run_app() -> windows::core::Result<()> {
             || (focus_active && !focus_paused)
             || activity_mgr.active_notification.is_some()
             || is_volume_hud_active
+            || clip_copied_banner_until.is_some() // Keeps the message loop awake while the banner timer counts down
             || (latest_media.is_playing && current_state != IslandState::Tucked);
 
         if needs_next_frame {
