@@ -410,7 +410,7 @@ impl SportsService {
             if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(date) {
                 return parsed
                     .with_timezone(&chrono::Local)
-                    .format("%a, %b %-d · %-I:%M %p")
+                    .format("%a, %b %-d \u{00B7} %-I:%M %p")
                     .to_string();
             }
         }

@@ -449,7 +449,7 @@ impl ExpandedRenderer {
                 } else {
                     let now = chrono::Local::now();
                     let t = now.format("%I:%M %p").to_string();
-                    let d = format!("â€¢  {}", now.format("%a, %b %e"));
+                    let d = format!("\u{2022}  {}", now.format("%a, %b %e"));
                     let w = canvas.measure_text_width(&t, 13.0, true);
                     *cache = Some((now_inst, t.clone(), d.clone(), w));
                     (t, d, w)
@@ -457,7 +457,7 @@ impl ExpandedRenderer {
             } else {
                 let now = chrono::Local::now();
                 let t = now.format("%I:%M %p").to_string();
-                let d = format!("â€¢  {}", now.format("%a, %b %e"));
+                let d = format!("\u{2022}  {}", now.format("%a, %b %e"));
                 let w = canvas.measure_text_width(&t, 13.0, true);
                 *cache = Some((now_inst, t.clone(), d.clone(), w));
                 (t, d, w)
@@ -1290,7 +1290,7 @@ impl ExpandedRenderer {
 
             // Track target translation: centers selected tick under cursor.
             // The fractional value lets the ruler elastically overscroll at its
-            // 1â€“60 minute limits before springing back.
+            // 1-60 minute limits before springing back.
             let track_x = center_x - (visual_mins * tick_width);
 
             // Draw ticks (0 to 60 minutes)
@@ -1487,7 +1487,7 @@ impl ExpandedRenderer {
             }
 
             let status_prefix = if paused { "TIMER PAUSED" } else { "FOCUS SESSION" };
-            let header_str = format!("{} Â· ENDS AT {}", status_prefix, done_at);
+            let header_str = format!("{} \u{00B7} ENDS AT {}", status_prefix, done_at);
             let gray_header = Color::from_rgba8(142, 142, 147, 255); // #8e8e93
             canvas.draw_text(&header_str, info_x + 18.0, y + 4.0, 11.0, gray_header, true);
 
@@ -1907,7 +1907,7 @@ impl ExpandedRenderer {
         } else {
             ""
         };
-        let detail = match_data.clock.trim().replace(" at ", " · ");
+        let detail = match_data.clock.trim().replace(" at ", " \u{00B7} ");
         let prefix_size = 9.5;
         let detail_size = 11.5;
         let group_gap = 6.0;

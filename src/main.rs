@@ -525,7 +525,7 @@ fn run_app() -> windows::core::Result<()> {
                                      app_user_model_id: "Microsoft.YourPhone".to_string(),
                                      badge_app: "phone".to_string(),
                                      title: "Me Jio".to_string(),
-                                     subtitle: "Incoming Call • Phone Link".to_string(),
+                                     subtitle: "Incoming Call \u{2022} Phone Link".to_string(),
                                      time_text: "now".to_string(),
                                      is_snip: false,
                                       is_call: true,

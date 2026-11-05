@@ -533,7 +533,7 @@ try {
                 "Calls".to_string(),
                 "phone".to_string(),
                 title,
-                "Incoming Call • Phone Link".to_string(),
+                "Incoming Call \u{2022} Phone Link".to_string(),
                 false,
                 true,
             );

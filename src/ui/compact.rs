@@ -524,7 +524,7 @@ impl CompactRenderer {
                 let center_str = if match_data.is_live {
                     format!("{} 🟢", match_data.clock)
                 } else {
-                    match_data.clock.trim().replace(" at ", " · ")
+                    match_data.clock.trim().replace(" at ", " \u{00B7} ")
                 };
                 let center_left = left + 9.0 + home_w + 14.0;
                 let center_right = away_x - 14.0;

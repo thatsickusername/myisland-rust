@@ -95,7 +95,7 @@ pub fn clean_title_and_artist(raw_title: &str, raw_artist: &str) -> (String, Str
     }
 
     // 3. Handle dash in title (Artist - Title) - same rule as MyIsland lines 1253-1257
-    for sep in [" - ", " – ", " — "] {
+    for sep in [" - ", " \u{2013} ", " \u{2014} "] {
         if let Some((part1, part2)) = title.split_once(sep) {
             let p1 = part1.trim();
             let p2 = part2.trim();

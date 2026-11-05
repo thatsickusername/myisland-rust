@@ -114,7 +114,7 @@ impl LayeredCanvas {
             // Pre-warm glyph cache for instant, zero-stutter first-frame rendering
             let mut glyph_cache = HashMap::with_capacity(512);
             let common_sizes = [9.5f32, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0];
-            let prewarm_chars = "0123456789:•-—.,!/?% APMabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            let prewarm_chars = "0123456789:\u{2022}-\u{2014}.,!/?% APMabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
             for &size in &common_sizes {
                 if let Some(ref f) = font_regular {
                     for ch in prewarm_chars.chars() {
