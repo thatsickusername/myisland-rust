@@ -38,7 +38,7 @@ extern "system" {
 }
 
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PostQuitMessage, TranslateMessage, MSG, WM_CLIPBOARDUPDATE,
@@ -77,6 +77,77 @@ fn sports_notification_id(base: u64, match_key: &str, salt: u64) -> u64 {
     match_key.hash(&mut hasher);
     salt.hash(&mut hasher);
     base + (hasher.finish() % 1_000_000_000)
+}
+
+/// Aggregate two damage rectangles into the smallest rect that contains both.
+fn union_rect(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
+/// Damage produced by a media-only tick (progress bar, lyrics, visualizer).
+/// The drop shadow and the rest of the canvas are static, so the island band
+/// (plus enough margin for the largest shadow blur) is the only area that can
+/// change.
+fn island_damage_rect(island_x: f32, island_w: f32, island_h: f32, secondary_h: f32) -> RECT {
+    let pad = 52.0;
+    RECT {
+        left: (island_x - pad).max(0.0) as i32,
+        top: 0,
+        right: (island_x + island_w + pad).min(WINDOW_WIDTH as f32) as i32,
+        bottom: (island_h.max(secondary_h) + pad).min(WINDOW_HEIGHT as f32) as i32,
+    }
+}
+
+/// Point-in-rounded-rectangle test used for hit-testing the window shape.
+fn point_in_round_rect(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
+    if px < x || px > x + w || py < y || py > y + h {
+        return false;
+    }
+    let r = r.min(w * 0.5).min(h * 0.5).max(0.0);
+    if r <= 0.0 {
+        return true;
+    }
+    let cx = px.clamp(x + r, x + w - r);
+    let cy = py.clamp(y + r, y + h - r);
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= r * r
+}
+
+/// Point-in-island test matching `build_island_path`: a rounded rectangle with
+/// the 10px top-bezel ear flares. `margin` expands the shape for hit tolerance.
+fn point_in_island(
+    px: f32,
+    py: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    margin: f32,
+) -> bool {
+    let ear = 10.0f32.min(h / 3.0).min(w / 2.0).max(0.0);
+    if py >= y - margin
+        && py <= y + ear + margin
+        && px >= x - ear - margin
+        && px <= x + w + ear + margin
+    {
+        return true;
+    }
+    point_in_round_rect(
+        px,
+        py,
+        x - margin,
+        y - margin,
+        w + margin * 2.0,
+        h + margin * 2.0,
+        r + margin,
+    )
 }
 
 unsafe extern "system" fn window_proc(
@@ -249,7 +320,7 @@ fn run_app() -> windows::core::Result<()> {
     let _ = NotificationService::request_access();
 
     // 4. Create Layered Canvas for 32-bit premultiplied alpha rendering
-    let mut canvas = LayeredCanvas::new(WINDOW_WIDTH, WINDOW_HEIGHT)?;
+    let mut canvas = LayeredCanvas::new(WINDOW_WIDTH, WINDOW_HEIGHT, window.hwnd)?;
 
     // 5. Physics Springs
     let mut spring_w = Spring::default_island(DIMS_REST.w);
@@ -368,7 +439,39 @@ fn run_app() -> windows::core::Result<()> {
     let mut current_progress_base: u64 = 0;
     let mut progress_anchor_time = Instant::now();
 
-    let mut is_dirty = true;
+    // Damage accumulation for the current frame. When the hardware path is
+    // active this drives DXGI_PRESENT_PARAMETERS; in the CPU fallback it still
+    // gates whether a frame is rendered at all.
+    let mut dirty_rect: Option<RECT> = Some(RECT {
+        left: 0,
+        top: 0,
+        right: WINDOW_WIDTH,
+        bottom: WINDOW_HEIGHT,
+    });
+
+    // Structural / interaction changes can move or repaint anything on the
+    // surface, so they invalidate the whole canvas.
+    macro_rules! mark_dirty_full {
+        () => {
+            dirty_rect = Some(RECT {
+                left: 0,
+                top: 0,
+                right: WINDOW_WIDTH,
+                bottom: WINDOW_HEIGHT,
+            });
+        };
+    }
+
+    // Use for updates known to stay inside a sub-region of the canvas.
+    macro_rules! mark_dirty_rect {
+        ($rect:expr) => {{
+            let damage: RECT = $rect;
+            dirty_rect = Some(match dirty_rect {
+                Some(existing) => union_rect(existing, damage),
+                None => damage,
+            });
+        }};
+    }
     let mut prev_pointer_x: f32 = -9999.0;
     let mut prev_pointer_y: f32 = -9999.0;
     let mut last_cursor_move_time = Instant::now();
@@ -376,6 +479,12 @@ fn run_app() -> windows::core::Result<()> {
     let mut pointer_vel_x: f32 = 0.0;
     let mut pointer_vel_y: f32 = 0.0;
     let mut prev_state = current_state;
+    // Last window region installed for GPU hit-testing, quantized to integer
+    // device pixels so we only touch the window when it actually changes.
+    let mut applied_interaction_region: Option<(
+        Vec<(i32, i32, i32, i32, i32)>,
+        Option<(i32, i32, i32, i32)>,
+    )> = None;
 
     // 8. Main Message Pump & Zero-Idle Render Gating Loop
     let mut msg = MSG::default();
@@ -392,7 +501,7 @@ fn run_app() -> windows::core::Result<()> {
             )
             .as_bool()
             {
-                is_dirty = true;
+                mark_dirty_full!();
                 if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
                     SHOULD_QUIT.store(true, Ordering::SeqCst);
                     break;
@@ -695,7 +804,7 @@ fn run_app() -> windows::core::Result<()> {
                                     let next_m = (curr_m + dir).clamp(1, 60);
                                     if next_m as u64 * 60 != focus_chosen_sec {
                                         focus_chosen_sec = next_m as u64 * 60;
-                                        is_dirty = true;
+                                        mark_dirty_full!();
                                     }
                                 }
                             } else if current_app == 4 && is_over_matches {
@@ -706,7 +815,7 @@ fn run_app() -> windows::core::Result<()> {
                                     let dir = if delta < 0 { 1.0 } else { -1.0 };
                                     target_match_index = (target_match_index + dir)
                                         .clamp(0.0, (count - 1) as f32);
-                                    is_dirty = true;
+                                    mark_dirty_full!();
                                 }
                             } else {
                                 let dir = if delta < 0 { 1.0 } else { -1.0 };
@@ -755,7 +864,7 @@ fn run_app() -> windows::core::Result<()> {
                         if over_main {
                             press_active = true;
                             content_scale_spring.target = 0.93;
-                            is_dirty = true;
+                            mark_dirty_full!();
                         }
                     }
                     WM_MOUSEMOVE => {
@@ -769,7 +878,7 @@ fn run_app() -> windows::core::Result<()> {
                             let new_mins = (raw_mins.round() as i32).clamp(1, 60);
                             if (new_mins as u64 * 60) != focus_chosen_sec {
                                 focus_chosen_sec = new_mins as u64 * 60;
-                                is_dirty = true;
+                                mark_dirty_full!();
                             }
                         }
                     }
@@ -779,14 +888,14 @@ fn run_app() -> windows::core::Result<()> {
                             // Snap the elastic overscroll back to the chosen tick.
                             ruler_spring.target = (focus_chosen_sec as f32 / 60.0).clamp(1.0, 60.0);
                             let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-                            is_dirty = true;
+                            mark_dirty_full!();
                         }
                         if press_active {
                             press_active = false;
                             content_scale_spring.set_target_with_impulse(1.0, 0.9);
                             spring_h.impulse(45.0);
                             spring_w.impulse(30.0);
-                            is_dirty = true;
+                            mark_dirty_full!();
                         }
                         let (px, py, _) = window.get_cursor_relative();
                         let w_cur = spring_w.value;
@@ -809,7 +918,7 @@ fn run_app() -> windows::core::Result<()> {
                                         }
                                     }
                                     activity_mgr.dismiss_notification();
-                                    is_dirty = true;
+                                    mark_dirty_full!();
                                 } else {
                                     let (primary_act, sec_act) = activity_mgr.get_activities();
                                     let sec_w = sec_spring_w.value;
@@ -854,7 +963,7 @@ fn run_app() -> windows::core::Result<()> {
                                     expanded_leave_timer = None;
                                     leave_timer_start = None;
                                     mascot.trigger_state(MascotState::IdleHappy, 1500);
-                                    is_dirty = true;
+                                    mark_dirty_full!();
                                 }
                             }
                         } else if current_state == IslandState::Expanded {
@@ -894,7 +1003,7 @@ fn run_app() -> windows::core::Result<()> {
                                         current_state = IslandState::Compact;
                                     }
                                 }
-                                is_dirty = true;
+                                mark_dirty_full!();
                             } else if px >= island_x_cur + w_cur - 38.0
                                 && px <= island_x_cur + w_cur - 16.0
                                 && py >= 9.0
@@ -1022,7 +1131,7 @@ fn run_app() -> windows::core::Result<()> {
                                         focus_end_time = Some(Instant::now() + std::time::Duration::from_secs(focus_chosen_sec));
                                         activity_mgr.update_focus(true);
                                         mascot.trigger_state(MascotState::FocusActive, 3000);
-                                        is_dirty = true;
+                                        mark_dirty_full!();
                                     } else if can_collapse_outside {
                                         current_state = IslandState::Compact;
                                     }
@@ -1045,14 +1154,14 @@ fn run_app() -> windows::core::Result<()> {
                                             focus_paused = false;
                                             focus_end_time = Some(Instant::now() + focus_paused_remaining);
                                         }
-                                        is_dirty = true;
+                                        mark_dirty_full!();
                                     } else if px >= btn_x && px <= btn_x + btn_w && py >= stop_y && py <= stop_y + btn_h {
                                         focus_active = false;
                                         focus_paused = false;
                                         focus_end_time = None;
                                         activity_mgr.update_focus(false);
                                         mascot.trigger_state(MascotState::FocusFailed, 2500);
-                                        is_dirty = true;
+                                        mark_dirty_full!();
                                     } else if can_collapse_outside {
                                         current_state = IslandState::Compact;
                                     }
@@ -1209,7 +1318,7 @@ fn run_app() -> windows::core::Result<()> {
 
         // Receive any async events from background workers
         while let Ok(media) = media_rx.try_recv() {
-            is_dirty = true;
+            mark_dirty_full!();
             let key_changed = media.session_key != latest_media.session_key;
             if key_changed {
                 lyrics.update_track(&media.title, &media.artist, media.duration_ms, lyrics_tx.clone());
@@ -1249,7 +1358,7 @@ fn run_app() -> windows::core::Result<()> {
         }
 
         while let Ok(mut notif) = notif_rx.try_recv() {
-            is_dirty = true;
+            mark_dirty_full!();
             if notif.is_snip && notif.image_preview.is_none() {
                 notif.image_preview = ClipboardManager::read_clipboard_image_png();
             }
@@ -1262,19 +1371,19 @@ fn run_app() -> windows::core::Result<()> {
         }
 
         while let Ok((key, lines)) = lyrics_rx.try_recv() {
-            is_dirty = true;
+            mark_dirty_full!();
             lyrics.receive_loaded(key, lines);
         }
 
         while let Ok((key, art_bytes)) = art_rx.try_recv() {
-            is_dirty = true;
+            mark_dirty_full!();
             if key == latest_media.session_key {
                 album_art_mgr.update_official_artwork(&key, &art_bytes);
             }
         }
 
         while let Ok(event) = sports_rx.try_recv() {
-            is_dirty = true;
+            mark_dirty_full!();
             match event {
                 SportsEvent::Loading => {
                     // Config changed (or startup): drop stale matches and show
@@ -1384,7 +1493,7 @@ fn run_app() -> windows::core::Result<()> {
 
         if is_volume_hud_active && Instant::now() >= volume_hud_until {
             is_volume_hud_active = false;
-            is_dirty = true;
+            mark_dirty_full!();
         }
 
         // INSERT THE EXPIRATION CHECK HERE
@@ -1392,7 +1501,7 @@ fn run_app() -> windows::core::Result<()> {
             if Instant::now() >= until {
                 clip_copied_banner_until = None;
                 clip_copied_index = None;
-                is_dirty = true; 
+                mark_dirty_full!();
             }
         }
 
@@ -1425,7 +1534,7 @@ fn run_app() -> windows::core::Result<()> {
         }
 
         // Track Pointer & Proximity
-        let (pointer_x, pointer_y, _inside_window) = window.get_cursor_relative();
+        let (pointer_x, pointer_y, inside_window) = window.get_cursor_relative();
         let sample_now = Instant::now();
         if (pointer_x - prev_pointer_x).abs() > 0.5 || (pointer_y - prev_pointer_y).abs() > 0.5 {
             // Pointer velocity in px/s, exponentially smoothed. Guard the first
@@ -1445,7 +1554,7 @@ fn run_app() -> windows::core::Result<()> {
             prev_pointer_sample_time = sample_now;
             last_cursor_move_time = sample_now;
             mascot.notify_activity();
-            is_dirty = true;
+            mark_dirty_full!();
         } else {
             // Fade out stale momentum while the pointer rests.
             pointer_vel_x *= 0.82;
@@ -1502,7 +1611,7 @@ fn run_app() -> windows::core::Result<()> {
                     activity_mgr.is_notification_expanded = true;
                     current_state = IslandState::Expanded;
                     notification_hover_since = None;
-                    is_dirty = true;
+                    mark_dirty_full!();
                 }
             } else {
                 notification_hover_since = None;
@@ -1520,7 +1629,7 @@ fn run_app() -> windows::core::Result<()> {
                 activity_mgr.is_notification_expanded = false;
                 current_state = IslandState::Compact;
                 notification_leave_since = None;
-                is_dirty = true;
+                mark_dirty_full!();
             }
         } else {
             notification_hover_since = None;
@@ -1544,6 +1653,119 @@ fn run_app() -> windows::core::Result<()> {
         HIT_Y.store(0, Ordering::Relaxed);
         HIT_W.store(w_val as i32, Ordering::Relaxed);
         HIT_H.store(h_val as i32, Ordering::Relaxed);
+
+        // The hardware path has no `WS_EX_LAYERED`, so Windows cannot use the
+        // per-pixel alpha to decide which parts of the window are click-through.
+        // `WM_NCHITTEST`/`HTTRANSPARENT` only forwards within the same thread,
+        // which is why the empty canvas area behaved like a huge dead zone.
+        // A window region is enforced by the OS for cross-process hit testing.
+        //
+        // Keep the region at the visual bounds (island + shadow) at all times so
+        // the shadow blur and the top-bezel ear flares are never clipped. When
+        // the cursor is over the shadow, punch a tiny hole at the cursor instead
+        // of shrinking the whole window; that makes the click fall through while
+        // leaving the surrounding visuals intact.
+        let (interaction_shape, interaction_hole): (
+            Option<Vec<(f32, f32, f32, f32, f32)>>,
+            Option<(f32, f32, f32, f32)>,
+        ) = if inside_window && canvas.uses_hardware() {
+            let sec_w_now = sec_spring_w.value;
+            let sec_h_now = sec_spring_h.value;
+            let show_secondary =
+                current_state != IslandState::Tucked && sec_w_now > 1.5 && sec_h_now > 1.5;
+
+            // Matches ShadowRenderer: the cached blur is rendered at half
+            // resolution, so the on-screen pad is twice the blur pad.
+            let (shadow_blur, shadow_dy) = match current_state {
+                IslandState::Expanded => (34.0f32, 6.0f32),
+                IslandState::Tucked => (4.0f32, 1.0f32),
+                _ => (18.0f32, 6.0f32),
+            };
+            let pad = 2.0 * ((shadow_blur * 0.75).ceil() + 4.0);
+            let mut visual = vec![(
+                island_x - pad,
+                -pad,
+                w_val + pad * 2.0,
+                h_val + pad * 2.0 + shadow_dy,
+                spring_r.value + pad,
+            )];
+            if show_secondary {
+                let sec_pad = 2.0 * ((18.0f32 * 0.75).ceil() + 4.0);
+                visual.push((
+                    sec_spring_x.value - sec_pad,
+                    -sec_pad,
+                    sec_w_now + sec_pad * 2.0,
+                    sec_h_now + sec_pad * 2.0 + 6.0,
+                    sec_spring_r.value + sec_pad,
+                ));
+            }
+
+            let over_island = point_in_island(
+                pointer_x,
+                pointer_y,
+                island_x,
+                0.0,
+                w_val,
+                h_val,
+                spring_r.value,
+                4.0,
+            ) || (show_secondary
+                && point_in_island(
+                    pointer_x,
+                    pointer_y,
+                    sec_spring_x.value,
+                    0.0,
+                    sec_w_now,
+                    sec_h_now,
+                    sec_spring_r.value,
+                    4.0,
+                ));
+
+            let over_shadow = visual.iter().any(|&(x, y, w, h, r)| {
+                point_in_round_rect(pointer_x, pointer_y, x, y, w, h, r)
+            });
+
+            let hole = if over_shadow && !over_island {
+                // A single pixel under the cursor is enough for the click to
+                // fall through, and is hidden by the pointer itself.
+                Some((pointer_x, pointer_y, 1.0, 1.0))
+            } else {
+                None
+            };
+
+            (Some(visual), hole)
+        } else {
+            (None, None)
+        };
+
+        let interaction_key = interaction_shape.as_ref().map(|rects| {
+            let shape_key = rects
+                .iter()
+                .map(|&(x, y, w, h, r)| {
+                    (
+                        x.floor() as i32,
+                        y.floor() as i32,
+                        (x + w).ceil() as i32,
+                        (y + h).ceil() as i32,
+                        ((r * 2.0).round() as i32).max(1),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let hole_key = interaction_hole.map(|(x, y, w, h)| {
+                (
+                    x.floor() as i32,
+                    y.floor() as i32,
+                    (x + w).ceil() as i32,
+                    (y + h).ceil() as i32,
+                )
+            });
+            (shape_key, hole_key)
+        });
+
+        if interaction_key != applied_interaction_region {
+            window.set_interaction_region(interaction_shape.as_deref(), interaction_hole);
+            applied_interaction_region = interaction_key;
+        }
 
         // 2. Hover state transitions (executed BEFORE computing targets)
         let (primary_act, _sec_act) = activity_mgr.get_activities();
@@ -1625,7 +1847,7 @@ fn run_app() -> windows::core::Result<()> {
                 _ => {}
             }
             impulse_state = current_state;
-            is_dirty = true;
+            mark_dirty_full!();
         }
 
         if current_state == IslandState::Expanded {
@@ -1637,7 +1859,7 @@ fn run_app() -> windows::core::Result<()> {
         }
 
         if current_state != prev_state {
-            is_dirty = true;
+            mark_dirty_full!();
             prev_state = current_state;
         }
 
@@ -1850,7 +2072,7 @@ fn run_app() -> windows::core::Result<()> {
         let cursor_active = now.duration_since(last_cursor_move_time).as_millis() < 250
             && (current_state == IslandState::Rest || current_state == IslandState::Compact);
 
-        if springs_moving
+        let has_motion = springs_moving
             || particles_moving
             || ui_animating
             || cursor_active
@@ -1859,14 +2081,23 @@ fn run_app() -> windows::core::Result<()> {
             || expanded_leave_timer.is_some()
             || (focus_active && !focus_paused)
             || is_volume_hud_active
-            || activity_mgr.active_notification.is_some()
-            || (latest_media.is_playing && current_state != IslandState::Tucked)
-        {
-            is_dirty = true;
+            || activity_mgr.active_notification.is_some();
+
+        if has_motion {
+            mark_dirty_full!();
+        } else if latest_media.is_playing && current_state != IslandState::Tucked {
+            // Media-only tick (progress / lyrics / visualizer): the shadow and
+            // outer canvas are static, so only the island band is damaged.
+            mark_dirty_rect!(island_damage_rect(
+                island_x,
+                w_val,
+                h_val,
+                sec_spring_h.value
+            ));
         }
 
         // 9. Render Frame (Only when visual state is dirty)
-        if is_dirty {
+        if dirty_rect.is_some() {
             canvas.clear();
 
             // Liquid volume conservation (squash & stretch): outward width velocity
@@ -2256,9 +2487,9 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
-        // Present Frame to Win32 layered alpha window
-        canvas.present(window.hwnd, window.x, window.y);
-        is_dirty = false;
+        // Present Frame to the alpha-composited window (hardware or fallback)
+        canvas.present_with_dirty_rect(window.hwnd, window.x, window.y, dirty_rect);
+        dirty_rect = None;
     }
 
         // ZERO-IDLE RENDER GATING:
@@ -2278,7 +2509,29 @@ fn run_app() -> windows::core::Result<()> {
             || (latest_media.is_playing && current_state != IslandState::Tucked);
 
         if needs_next_frame {
-            is_dirty = true;
+            // Only the media tick needs the next frame when nothing else is
+            // moving; keep that next frame's damage local to the island band.
+            let motion_next = springs_moving
+                || leave_timer_start.is_some()
+                || expanded_leave_timer.is_some()
+                || particles_moving
+                || ui_animating
+                || cursor_active
+                || is_dragging_ruler
+                || (focus_active && !focus_paused)
+                || activity_mgr.active_notification.is_some()
+                || is_volume_hud_active
+                || clip_copied_banner_until.is_some();
+            if !motion_next && latest_media.is_playing && current_state != IslandState::Tucked {
+                mark_dirty_rect!(island_damage_rect(
+                    island_x,
+                    w_val,
+                    h_val,
+                    sec_spring_h.value
+                ));
+            } else {
+                mark_dirty_full!();
+            }
             let dwm_res = unsafe { windows::Win32::Graphics::Dwm::DwmFlush() };
             if dwm_res.is_err() {
                 let sleep_ms = if springs_moving || particles_moving { 8 } else { 16 };
@@ -2295,7 +2548,7 @@ fn run_app() -> windows::core::Result<()> {
             let delay_ms = if next_event > now {
                 (next_event.duration_since(now).as_millis() as u32).clamp(16, max_idle_sleep)
             } else {
-                is_dirty = true;
+                mark_dirty_full!();
                 16
             };
 

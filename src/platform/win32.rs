@@ -1,14 +1,18 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LRESULT, POINT, WPARAM, LPARAM};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HBRUSH, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Graphics::Gdi::{
+    CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow,
+    SetWindowRgn, HBRUSH, HRGN, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, RGN_DIFF, RGN_OR,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_SPACE,
     VK_VOLUME_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetCursorPos, RegisterClassExW, ShowWindow, SW_SHOWNOACTIVATE, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, GetCursorPos, RegisterClassExW, ShowWindow, SW_SHOWNOACTIVATE,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 pub const WINDOW_WIDTH: i32 = 860;
@@ -71,6 +75,7 @@ impl Win32Window {
             let ex_style = WS_EX_TOPMOST
                 | WS_EX_TOOLWINDOW
                 | WS_EX_LAYERED
+                | WS_EX_NOREDIRECTIONBITMAP
                 | WS_EX_NOACTIVATE;
 
             let style = WS_POPUP;
@@ -134,6 +139,81 @@ impl Win32Window {
     #[allow(dead_code)]
     pub fn set_interactive(&self, _interactive: bool) {
         // Handled via WM_NCHITTEST HTTRANSPARENT / HTCLIENT for per-pixel irregular hit testing
+    }
+
+    /// Restrict the window's OS-level shape, which also defines its hit-test
+    /// region, to the given rounded rectangles in window coordinates.
+    ///
+    /// The GPU/DirectComposition path does not use `WS_EX_LAYERED`, so Windows
+    /// no longer performs per-pixel alpha hit-testing. A window region is the
+    /// only mechanism that makes empty areas click-through across processes.
+    /// `hole` (x, y, width, height) is subtracted from the region so a click at
+    /// that point falls through while the surrounding visuals stay intact.
+    /// Passing `None` for `rects` removes the region and restores the full
+    /// window shape.
+    pub fn set_interaction_region(
+        &self,
+        rects: Option<&[(f32, f32, f32, f32, f32)]>,
+        hole: Option<(f32, f32, f32, f32)>,
+    ) {
+        unsafe {
+            let Some(rects) = rects else {
+                let _ = SetWindowRgn(self.hwnd, HRGN::default(), true);
+                return;
+            };
+
+            let combined = CreateRectRgn(0, 0, 0, 0);
+            if combined.is_invalid() {
+                return;
+            }
+
+            let mut has_part = false;
+            for &(x, y, w, h, r) in rects {
+                if !w.is_finite() || !h.is_finite() || w <= 0.5 || h <= 0.5 {
+                    continue;
+                }
+                let left = x.floor() as i32;
+                let top = y.floor() as i32;
+                let right = (x + w).ceil() as i32;
+                let bottom = (y + h).ceil() as i32;
+                if right <= left || bottom <= top {
+                    continue;
+                }
+                let diameter = ((r * 2.0).round() as i32).max(1);
+                let part = CreateRoundRectRgn(left, top, right, bottom, diameter, diameter);
+                if part.is_invalid() {
+                    continue;
+                }
+                let _ = CombineRgn(combined, combined, part, RGN_OR);
+                let _ = DeleteObject(part);
+                has_part = true;
+            }
+
+            if !has_part {
+                let _ = DeleteObject(combined);
+                let _ = SetWindowRgn(self.hwnd, HRGN::default(), true);
+                return;
+            }
+
+            if let Some((x, y, w, h)) = hole {
+                let left = x.floor() as i32;
+                let top = y.floor() as i32;
+                let right = (x + w).ceil() as i32;
+                let bottom = (y + h).ceil() as i32;
+                if right > left && bottom > top {
+                    let hole_rgn = CreateRectRgn(left, top, right, bottom);
+                    if !hole_rgn.is_invalid() {
+                        let _ = CombineRgn(combined, combined, hole_rgn, RGN_DIFF);
+                        let _ = DeleteObject(hole_rgn);
+                    }
+                }
+            }
+
+            // On success Windows owns `combined`; only free it if the call failed.
+            if SetWindowRgn(self.hwnd, combined, true) == 0 {
+                let _ = DeleteObject(combined);
+            }
+        }
     }
 
     pub fn get_cursor_relative(&self) -> (f32, f32, bool) {

@@ -3,15 +3,36 @@ use std::fs;
 use std::ptr;
 use std::sync::Arc;
 use fontdue::{Font, FontSettings, Metrics};
+use windows::core::Interface;
 use tiny_skia::{Color, FillRule, Mask, Pixmap, PixmapPaint, Transform};
-use windows::Win32::Foundation::{HWND, POINT, SIZE};
+use windows::Win32::Foundation::{BOOL, HMODULE, HWND, POINT, RECT, SIZE};
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DYNAMIC,
+};
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1, DXGI_PRESENT,
+    DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HBITMAP,
     BLENDFUNCTION, AC_SRC_ALPHA, AC_SRC_OVER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    UpdateLayeredWindow, ULW_ALPHA,
+    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, UpdateLayeredWindow, GWL_EXSTYLE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, ULW_ALPHA,
+    WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP,
 };
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
@@ -27,6 +48,16 @@ struct CachedGlyph {
     bitmap: Vec<u8>,
 }
 
+struct HardwareHandles {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    swapchain: IDXGISwapChain1,
+    upload: ID3D11Texture2D,
+    dcomp_device: IDCompositionDevice,
+    dcomp_target: IDCompositionTarget,
+    dcomp_visual: IDCompositionVisual,
+}
+
 pub struct LayeredCanvas {
     pub width: i32,
     pub height: i32,
@@ -36,6 +67,16 @@ pub struct LayeredCanvas {
     pub pixmap: Pixmap,
     pub content_pixmap: Pixmap,
     pub mask: Mask,
+    // Hardware-accelerated presentation path (D3D11 -> DXGI -> DirectComposition).
+    // All `None` when the CPU/UpdateLayeredWindow fallback is in use.
+    d3d_device: Option<ID3D11Device>,
+    d3d_context: Option<ID3D11DeviceContext>,
+    swapchain: Option<IDXGISwapChain1>,
+    upload_texture: Option<ID3D11Texture2D>,
+    _dcomp_device: Option<IDCompositionDevice>,
+    _dcomp_target: Option<IDCompositionTarget>,
+    _dcomp_visual: Option<IDCompositionVisual>,
+    hardware_ready: bool,
     pub font_regular: Option<Arc<Font>>,
     pub font_bold: Option<Arc<Font>>,
     pub font_icon: Option<Arc<Font>>,
@@ -43,7 +84,7 @@ pub struct LayeredCanvas {
 }
 
 impl LayeredCanvas {
-    pub fn new(width: i32, height: i32) -> windows::core::Result<Self> {
+    pub fn new(width: i32, height: i32, hwnd: HWND) -> windows::core::Result<Self> {
         unsafe {
             let hdc_mem = CreateCompatibleDC(None);
             let bmi = BITMAPINFO {
@@ -130,6 +171,17 @@ impl LayeredCanvas {
                 }
             }
 
+            let hardware = if std::env::var_os("MYISLAND_DISABLE_GPU").is_some() {
+                None
+            } else {
+                Self::try_init_hardware(width, height, hwnd)
+            };
+            if hardware.is_some() {
+                Self::enable_composition_style(hwnd);
+            } else {
+                Self::restore_layered_style(hwnd);
+            }
+
             Ok(Self {
                 width,
                 height,
@@ -139,12 +191,197 @@ impl LayeredCanvas {
                 pixmap,
                 content_pixmap,
                 mask,
+                d3d_device: hardware.as_ref().map(|h| h.device.clone()),
+                d3d_context: hardware.as_ref().map(|h| h.context.clone()),
+                swapchain: hardware.as_ref().map(|h| h.swapchain.clone()),
+                upload_texture: hardware.as_ref().map(|h| h.upload.clone()),
+                _dcomp_device: hardware.as_ref().map(|h| h.dcomp_device.clone()),
+                _dcomp_target: hardware.as_ref().map(|h| h.dcomp_target.clone()),
+                _dcomp_visual: hardware.as_ref().map(|h| h.dcomp_visual.clone()),
+                hardware_ready: hardware.is_some(),
                 font_regular,
                 font_bold,
                 font_icon,
                 glyph_cache,
             })
         }
+    }
+
+    /// Attempt to bring up the hardware presentation stack. Any failure at any
+    /// stage simply returns `None`, leaving the DIB/UpdateLayeredWindow path in
+    /// charge. This keeps the app functional on machines without a usable
+    /// hardware D3D11 adapter (RDP, VMs, old drivers, ...).
+    fn try_init_hardware(width: i32, height: i32, hwnd: HWND) -> Option<HardwareHandles> {
+        macro_rules! fail {
+            () => {{
+                return None;
+            }};
+        }
+        macro_rules! try_result {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => value,
+                    Err(_) => fail!(),
+                }
+            };
+        }
+        unsafe {
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+
+            try_result!(D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            ));
+
+            let device = match device {
+                Some(device) => device,
+                None => fail!(),
+            };
+            let context = match context {
+                Some(context) => context,
+                None => fail!(),
+            };
+
+            let dxgi_device: IDXGIDevice = try_result!(device.cast());
+            let adapter = try_result!(dxgi_device.GetAdapter());
+            let factory: IDXGIFactory2 = try_result!(adapter.GetParent());
+
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: width as u32,
+                Height: height as u32,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Stereo: BOOL(0),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                Flags: 0,
+            };
+
+            let swapchain = try_result!(factory.CreateSwapChainForComposition(
+                &dxgi_device,
+                &desc,
+                None::<&IDXGIOutput>,
+            ));
+
+            // A single reusable dynamic texture is the CPU -> GPU upload
+            // target. Keeping it dynamic lets each frame Map/WRITE_DISCARD it
+            // without allocating a new texture.
+            let upload_desc = D3D11_TEXTURE2D_DESC {
+                Width: width as u32,
+                Height: height as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                MiscFlags: 0,
+            };
+
+            let mut upload: Option<ID3D11Texture2D> = None;
+            try_result!(device.CreateTexture2D(&upload_desc, None, Some(&mut upload)));
+            let upload = match upload {
+                Some(upload) => upload,
+                None => fail!(),
+            };
+
+            let dcomp_device: IDCompositionDevice =
+                try_result!(DCompositionCreateDevice(&dxgi_device));
+            let dcomp_target =
+                try_result!(dcomp_device.CreateTargetForHwnd(hwnd, BOOL(1)));
+            let dcomp_visual = try_result!(dcomp_device.CreateVisual());
+
+            try_result!(dcomp_visual.SetContent(&swapchain));
+            try_result!(dcomp_target.SetRoot(&dcomp_visual));
+            try_result!(dcomp_device.Commit());
+
+            Some(HardwareHandles {
+                device,
+                context,
+                swapchain,
+                upload,
+                dcomp_device,
+                dcomp_target,
+                dcomp_visual,
+            })
+        }
+    }
+
+    /// DirectComposition presents through the DWM composition tree, so the
+    /// window must stop using the legacy layered redirection surface.
+    fn enable_composition_style(hwnd: HWND) {
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let style = (style & !(WS_EX_LAYERED.0 as isize))
+                | WS_EX_NOREDIRECTIONBITMAP.0 as isize;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    /// Restore the layered-window style when the GPU path cannot present so
+    /// the CPU fallback keeps producing a visible alpha window.
+    fn restore_layered_style(hwnd: HWND) {
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let style = (style & !(WS_EX_NOREDIRECTIONBITMAP.0 as isize))
+                | WS_EX_LAYERED.0 as isize;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    /// Drop the GPU objects and return to the DIB/UpdateLayeredWindow path.
+    fn disable_hardware(&mut self, hwnd: HWND) {
+        self.hardware_ready = false;
+        self.d3d_device = None;
+        self.d3d_context = None;
+        self.swapchain = None;
+        self.upload_texture = None;
+        self._dcomp_device = None;
+        self._dcomp_target = None;
+        self._dcomp_visual = None;
+
+        Self::restore_layered_style(hwnd);
+    }
+
+    #[allow(dead_code)]
+    pub fn is_hardware_accelerated(&self) -> bool {
+        self.hardware_ready
     }
 
     pub fn clear(&mut self) {
@@ -193,6 +430,12 @@ impl LayeredCanvas {
         self.end_island_content(path, 1.0, 0.0, 0.0);
     }
 
+    /// Whether presentation is currently going through the D3D11/DXGI/
+    /// DirectComposition path rather than the `UpdateLayeredWindow` fallback.
+    pub fn uses_hardware(&self) -> bool {
+        self.hardware_ready
+    }
+
     /// Present the pixmap to the Win32 layered window.
     pub fn present(&mut self, hwnd: HWND, window_x: i32, window_y: i32) {
         let src_data = self.pixmap.data();
@@ -239,6 +482,149 @@ impl LayeredCanvas {
                 Some(&blend),
                 ULW_ALPHA,
             );
+        }
+    }
+
+    /// Present the current pixmap. Prefers the D3D11/DXGI/DirectComposition
+    /// path when available and transparently falls back to
+    /// `UpdateLayeredWindow` otherwise.
+    ///
+    /// `dirty_rect` is the accumulated damage for this frame in canvas pixels.
+    /// When omitted the whole surface is treated as damaged.
+    pub fn present_with_dirty_rect(
+        &mut self,
+        hwnd: HWND,
+        window_x: i32,
+        window_y: i32,
+        dirty_rect: Option<RECT>,
+    ) {
+        if self.hardware_ready {
+            if self.present_hardware(dirty_rect) {
+                return;
+            }
+            // Device removed/lost or the swapchain rejected the frame. Drop
+            // the GPU objects and let the DIB path take over from here.
+            self.disable_hardware(hwnd);
+        }
+        self.present(hwnd, window_x, window_y);
+    }
+
+    fn present_hardware(&mut self, dirty_rect: Option<RECT>) -> bool {
+        let (Some(context), Some(swapchain), Some(upload)) = (
+            self.d3d_context.as_ref(),
+            self.swapchain.as_ref(),
+            self.upload_texture.as_ref(),
+        ) else {
+            return false;
+        };
+
+        let width = self.width as usize;
+        let height = self.height as usize;
+        if width == 0 || height == 0 {
+            return true;
+        }
+
+        let rect = clamp_rect(
+            dirty_rect.unwrap_or(RECT {
+                left: 0,
+                top: 0,
+                right: self.width,
+                bottom: self.height,
+            }),
+            self.width,
+            self.height,
+        );
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return true;
+        }
+
+        let is_full = rect.left == 0
+            && rect.top == 0
+            && rect.right == self.width
+            && rect.bottom == self.height;
+
+        unsafe {
+            let backbuffer: ID3D11Texture2D = match swapchain.GetBuffer(0) {
+                Ok(buffer) => buffer,
+                Err(_) => return false,
+            };
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if context
+                .Map(
+                    upload,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
+                .is_err()
+            {
+                return false;
+            }
+
+            // tiny-skia produces premultiplied RGBA; the swapchain expects
+            // premultiplied BGRA. Only the damaged span is converted, so a
+            // small lyrics tick does not touch the full 860x340 surface.
+            let src = self.pixmap.data();
+            let src_pixels =
+                std::slice::from_raw_parts(src.as_ptr() as *const u32, width * height);
+            let dst_base = mapped.pData as *mut u8;
+            let row_pitch = mapped.RowPitch as usize;
+            let x0 = rect.left as usize;
+            let y0 = rect.top as usize;
+            let x1 = rect.right as usize;
+            let y1 = rect.bottom as usize;
+
+            for y in y0..y1 {
+                let src_row = &src_pixels[y * width + x0..y * width + x1];
+                let dst_row = std::slice::from_raw_parts_mut(
+                    dst_base.add(y * row_pitch) as *mut u32,
+                    x1 - x0,
+                );
+                for (src_px, dst_px) in src_row.iter().zip(dst_row.iter_mut()) {
+                    let px = *src_px;
+                    *dst_px = (px & 0xFF00FF00)
+                        | ((px & 0x00FF0000) >> 16)
+                        | ((px & 0x000000FF) << 16);
+                }
+            }
+
+            context.Unmap(upload, 0);
+
+            if is_full {
+                context.CopyResource(&backbuffer, upload);
+            } else {
+                // FLIP_SEQUENTIAL preserves the untouched area of the
+                // backbuffer, so only the damaged sub-rect needs copying.
+                let src_box = D3D11_BOX {
+                    left: x0 as u32,
+                    top: y0 as u32,
+                    front: 0,
+                    right: x1 as u32,
+                    bottom: y1 as u32,
+                    back: 1,
+                };
+                context.CopySubresourceRegion(
+                    &backbuffer,
+                    0,
+                    x0 as u32,
+                    y0 as u32,
+                    0,
+                    upload,
+                    0,
+                    Some(&src_box),
+                );
+            }
+
+            let mut present_params = DXGI_PRESENT_PARAMETERS::default();
+            let mut dirty = rect;
+            if !is_full {
+                present_params.DirtyRectsCount = 1;
+                present_params.pDirtyRects = &mut dirty;
+            }
+
+            swapchain.Present1(1, DXGI_PRESENT(0), &present_params).is_ok()
         }
     }
 
@@ -547,6 +933,15 @@ impl LayeredCanvas {
         } else {
             String::new()
         }
+    }
+}
+
+fn clamp_rect(rect: RECT, width: i32, height: i32) -> RECT {
+    RECT {
+        left: rect.left.clamp(0, width),
+        top: rect.top.clamp(0, height),
+        right: rect.right.clamp(0, width),
+        bottom: rect.bottom.clamp(0, height),
     }
 }
 
