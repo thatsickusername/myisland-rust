@@ -1,7 +1,7 @@
 use crate::platform::MediaState;
 use crate::render::{AlbumArtManager, LayeredCanvas, MascotEngine};
 use crate::state::{clean_title_and_artist, ClipboardManager, LyricsState, NotificationPayload, SportsState};
-use tiny_skia::{Color, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
+use tiny_skia::{Color, FillRule, FilterQuality, Mask, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform};
 
 pub const APP_NAMES: [&str; 5] = ["MUSIC", "CLIPBOARD", "NOTES", "FOCUS", "MATCHES"];
 
@@ -405,7 +405,9 @@ impl ExpandedRenderer {
         clip_scroll_progress: f32,
         target_notes_scroll: &mut f32,
         notes_scroll_progress: f32,
-        sports: Option<&SportsState>,
+        sports: &[SportsState],
+        sports_loading: bool,
+        sports_scroll: f32,
     ) -> bool {
         // Faithful to MyIsland index.html line 3598: card content only renders when h > 80.0
         if h <= 80.0 {
@@ -424,7 +426,7 @@ impl ExpandedRenderer {
         let header_alpha = content_alpha * e_text;
 
         // 1. Small Companion eyes at top-left
-        let animating = mascot.update_and_draw(
+        let mut animating = mascot.update_and_draw(
             &mut canvas.pixmap.as_mut(),
             island_x + 28.0,
             20.0,
@@ -447,7 +449,7 @@ impl ExpandedRenderer {
                 } else {
                     let now = chrono::Local::now();
                     let t = now.format("%I:%M %p").to_string();
-                    let d = format!("•  {}", now.format("%a, %b %e"));
+                    let d = format!("â€¢  {}", now.format("%a, %b %e"));
                     let w = canvas.measure_text_width(&t, 13.0, true);
                     *cache = Some((now_inst, t.clone(), d.clone(), w));
                     (t, d, w)
@@ -455,7 +457,7 @@ impl ExpandedRenderer {
             } else {
                 let now = chrono::Local::now();
                 let t = now.format("%I:%M %p").to_string();
-                let d = format!("•  {}", now.format("%a, %b %e"));
+                let d = format!("â€¢  {}", now.format("%a, %b %e"));
                 let w = canvas.measure_text_width(&t, 13.0, true);
                 *cache = Some((now_inst, t.clone(), d.clone(), w));
                 (t, d, w)
@@ -538,7 +540,20 @@ impl ExpandedRenderer {
                     focus_chosen_sec,
                     ruler_visual_mins,
                 ),
-                4 => Self::render_sports(canvas, body_x, body_y, body_w, sports, e_text),
+                4 => {
+                    if Self::render_sports(
+                        canvas,
+                        body_x,
+                        body_y,
+                        body_w,
+                        sports,
+                        e_text,
+                        sports_loading,
+                        sports_scroll,
+                    ) {
+                        animating = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1275,7 +1290,7 @@ impl ExpandedRenderer {
 
             // Track target translation: centers selected tick under cursor.
             // The fractional value lets the ruler elastically overscroll at its
-            // 1–60 minute limits before springing back.
+            // 1â€“60 minute limits before springing back.
             let track_x = center_x - (visual_mins * tick_width);
 
             // Draw ticks (0 to 60 minutes)
@@ -1472,7 +1487,7 @@ impl ExpandedRenderer {
             }
 
             let status_prefix = if paused { "TIMER PAUSED" } else { "FOCUS SESSION" };
-            let header_str = format!("{} · ENDS AT {}", status_prefix, done_at);
+            let header_str = format!("{} Â· ENDS AT {}", status_prefix, done_at);
             let gray_header = Color::from_rgba8(142, 142, 147, 255); // #8e8e93
             canvas.draw_text(&header_str, info_x + 18.0, y + 4.0, 11.0, gray_header, true);
 
@@ -1725,202 +1740,48 @@ impl ExpandedRenderer {
         x: f32,
         y: f32,
         bw: f32,
-        sports: Option<&SportsState>,
+        sports: &[SportsState],
         e_text: f32,
-    ) {
+        sports_loading: bool,
+        scroll: f32,
+    ) -> bool {
         let text_dy = (1.0 - e_text) * 8.0;
-        let alpha_u8 = (255.0 * e_text) as u8;
         let muted = Color::from_rgba8(138, 138, 143, (215.0 * e_text) as u8);
 
-        if let Some(match_data) = sports {
-            // Header: quiet section label on the left, a slightly brighter
-            // status group on the right. The status prefix is dimmed so the
-            // kickoff/clock stays the focal point of the row.
-            let header_y = y + 11.0 + text_dy;
-            let section_title = if match_data.is_upcoming {
-                "UPCOMING MATCH"
-            } else if match_data.is_live {
-                "LIVE SPORTS"
-            } else {
-                "FINAL"
-            };
-            let section_size = 10.5;
-            canvas.draw_text(section_title, x + 16.0, header_y, section_size, muted, true);
-            let section_w = canvas.measure_text_width(section_title, section_size, true);
-
-            let prefix = if match_data.is_live {
-                "LIVE"
-            } else if match_data.is_upcoming {
-                "UP NEXT"
-            } else {
-                ""
-            };
-            let detail = match_data.clock.trim().replace(" at ", " · ");
-            let prefix_size = 9.5;
-            let detail_size = 11.5;
-            let group_gap = 6.0;
-            let prefix_w = if prefix.is_empty() {
-                0.0
-            } else {
-                canvas.measure_text_width(prefix, prefix_size, true)
-            };
-            let available = (bw - 32.0 - section_w - 24.0).max(100.0);
-            let detail_max = (available - prefix_w - group_gap).max(70.0);
-            let detail = canvas.truncate_to_width(&detail, detail_max, detail_size, true);
-            let detail_w = canvas.measure_text_width(&detail, detail_size, true);
-            let detail_x = x + bw - 16.0 - detail_w;
-            let prefix_x = detail_x - group_gap - prefix_w;
-
-            // Only show the prefix when it still leaves a clean gap after the
-            // section label; long status text drops it instead of crowding.
-            if !prefix.is_empty() && prefix_x >= x + 16.0 + section_w + 14.0 {
+        if sports.is_empty() {
+            if sports_loading {
+                // The worker publishes `Loading` as soon as the settings file
+                // changes, so the user gets immediate feedback instead of a
+                // blank panel while the staggered fetch runs.
+                let elapsed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let dots = ".".repeat(((elapsed / 350) % 4) as usize);
+                let label = format!("Fetching match data{dots}");
+                let lw = canvas.measure_text_width(&label, 12.5, true);
                 canvas.draw_text(
-                    prefix,
-                    prefix_x,
-                    header_y,
-                    prefix_size,
-                    Color::from_rgba8(142, 142, 147, alpha_u8),
+                    &label,
+                    x + (bw - lw) / 2.0,
+                    y + 44.0 + text_dy,
+                    12.5,
+                    Color::from_rgba8(255, 255, 255, (235.0 * e_text) as u8),
                     true,
                 );
-            }
-            canvas.draw_text(
-                &detail,
-                detail_x,
-                header_y,
-                detail_size,
-                Color::from_rgba8(255, 255, 255, alpha_u8),
-                true,
-            );
 
-            // Arena: logos, team codes, and scores all share one centerline.
-            let arena_cy = y + 57.0 + text_dy;
-            let logo_size = 32.0;
-            let logo_y = arena_cy - logo_size / 2.0;
-            Self::draw_sports_logo(
-                canvas,
-                match_data.home_logo.as_deref(),
-                x + 4.0,
-                logo_y,
-                logo_size,
-                match_data.home_color,
-                e_text,
-            );
-            Self::draw_sports_logo(
-                canvas,
-                match_data.away_logo.as_deref(),
-                x + bw - logo_size - 4.0,
-                logo_y,
-                logo_size,
-                match_data.away_color,
-                e_text,
-            );
-
-            let team_size = 21.0;
-            let team_color = Color::from_rgba8(238, 238, 242, alpha_u8);
-            let logo_gap = 10.0;
-            let home_text_x = x + 4.0 + logo_size + logo_gap;
-            let away_text_right = x + bw - (4.0 + logo_size + logo_gap);
-            let home_text_y = canvas.text_y_for_vertical_center(
-                &match_data.home_team,
-                team_size,
-                true,
-                arena_cy,
-            );
-            let away_text_y = canvas.text_y_for_vertical_center(
-                &match_data.away_team,
-                team_size,
-                true,
-                arena_cy,
-            );
-            canvas.draw_text(
-                &match_data.home_team,
-                home_text_x,
-                home_text_y,
-                team_size,
-                team_color,
-                true,
-            );
-            let away_w = canvas.measure_text_width(&match_data.away_team, team_size, true);
-            canvas.draw_text(
-                &match_data.away_team,
-                away_text_right - away_w,
-                away_text_y,
-                team_size,
-                team_color,
-                true,
-            );
-
-            // Scores are the visual anchor: larger and brighter than the team
-            // codes, with a quiet vector separator between them.
-            let center_x = x + bw / 2.0;
-            let home_score = match_data.home_score.to_string();
-            let away_score = match_data.away_score.to_string();
-            let score_size = 29.0;
-            let home_score_w = canvas.measure_text_width(&home_score, score_size, true);
-            let score_gap = 22.0;
-            let number_color = Color::from_rgba8(255, 255, 255, alpha_u8);
-            let home_score_y =
-                canvas.text_y_for_vertical_center(&home_score, score_size, true, arena_cy);
-            let away_score_y =
-                canvas.text_y_for_vertical_center(&away_score, score_size, true, arena_cy);
-            canvas.draw_text(
-                &home_score,
-                center_x - score_gap - home_score_w,
-                home_score_y,
-                score_size,
-                number_color,
-                true,
-            );
-            canvas.draw_text(
-                &away_score,
-                center_x + score_gap,
-                away_score_y,
-                score_size,
-                number_color,
-                true,
-            );
-
-            // Use a native vector separator instead of a box-drawing glyph;
-            // the latter renders as missing-glyph squares in the bundled font.
-            let mut separator = Paint::default();
-            separator.anti_alias = true;
-            separator.set_color_rgba8(142, 142, 147, (190.0 * e_text) as u8);
-            let mut separator_path = PathBuilder::new();
-            separator_path.move_to(center_x - 6.0, arena_cy);
-            separator_path.line_to(center_x + 6.0, arena_cy);
-            if let Some(path) = separator_path.finish() {
-                canvas.pixmap.stroke_path(
-                    &path,
-                    &separator,
-                    &Stroke {
-                        width: 2.0,
-                        line_cap: tiny_skia::LineCap::Round,
-                        ..Default::default()
-                    },
-                    Transform::identity(),
-                    None,
-                );
-            }
-
-            // Keep the optional event note in its own band between the arena
-            // and the tab selector instead of letting it reach the tabs.
-            if let Some(event) = match_data
-                .latest_event
-                .as_deref()
-                .map(str::trim)
-                .filter(|event| !event.is_empty())
-            {
-                let event = canvas.truncate_to_width(event, bw - 32.0, 11.5, false);
+                let sub = "Checking today's fixtures across competitions";
+                let sw = canvas.measure_text_width(sub, 11.0, false);
                 canvas.draw_text(
-                    &event,
-                    x + 16.0,
-                    y + 86.0 + text_dy,
-                    11.5,
-                    Color::from_rgba8(200, 200, 206, (180.0 * e_text) as u8),
+                    sub,
+                    x + (bw - sw) / 2.0,
+                    y + 64.0 + text_dy,
+                    11.0,
+                    muted,
                     false,
                 );
+                return true;
             }
-        } else {
+
             let empty_str = "No live matches pinned";
             let ew = canvas.measure_text_width(empty_str, 12.5, false);
             canvas.draw_text(
@@ -1930,6 +1791,348 @@ impl ExpandedRenderer {
                 12.5,
                 muted,
                 false,
+            );
+            return false;
+        }
+
+        // Vertical viewport for the match stack. The island only clips its
+        // outer shape, so translated cards need their own band mask to avoid
+        // bleeding into the header and camera-mode selector.
+        const MATCH_PITCH: f32 = 102.0;
+        const VIEW_TOP_OFFSET: f32 = -4.0;
+        const VIEW_HEIGHT: f32 = 102.0;
+        let clip_top = y + text_dy + VIEW_TOP_OFFSET;
+        let clip_bottom = clip_top + VIEW_HEIGHT;
+
+        let clip_mask = if sports.len() > 1 {
+            let mut mask = Mask::new(canvas.width as u32, canvas.height as u32);
+            if let Some(mask) = mask.as_mut() {
+                let mut pb = PathBuilder::new();
+                Self::add_round_rect(
+                    &mut pb,
+                    x - 10.0,
+                    clip_top,
+                    bw + 20.0,
+                    VIEW_HEIGHT,
+                    14.0,
+                );
+                if let Some(path) = pb.finish() {
+                    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+                }
+            }
+            mask
+        } else {
+            None
+        };
+
+        let center_slot = scroll.round() as i32;
+        for offset in -1..=1 {
+            let slot = center_slot + offset;
+            if slot < 0 || slot as usize >= sports.len() {
+                continue;
+            }
+            let offset_dist = slot as f32 - scroll;
+            if offset_dist.abs() >= 1.0 {
+                continue;
+            }
+
+            let card_y = y + text_dy + offset_dist * MATCH_PITCH;
+            Self::render_sports_card(
+                canvas,
+                &sports[slot as usize],
+                x,
+                card_y,
+                bw,
+                e_text,
+                clip_mask.as_ref(),
+                clip_top,
+                clip_bottom,
+            );
+        }
+
+        if sports.len() > 1 {
+            Self::render_match_indicator(canvas, x, y, bw, sports.len(), scroll, e_text);
+        }
+
+        false
+    }
+
+    fn render_sports_card(
+        canvas: &mut LayeredCanvas,
+        match_data: &SportsState,
+        x: f32,
+        y: f32,
+        bw: f32,
+        e_text: f32,
+        mask: Option<&Mask>,
+        clip_min_y: f32,
+        clip_max_y: f32,
+    ) {
+        let alpha_u8 = (255.0 * e_text) as u8;
+        let muted = Color::from_rgba8(138, 138, 143, (215.0 * e_text) as u8);
+        let clip_min_x = x - 10.0;
+        let clip_max_x = x + bw + 10.0;
+
+        let draw_text = |canvas: &mut LayeredCanvas,
+                         text: &str,
+                         tx: f32,
+                         ty: f32,
+                         size: f32,
+                         color: Color,
+                         bold: bool| {
+            canvas.draw_text_clipped_box(
+                text, tx, ty, size, color, bold, clip_min_x, clip_max_x, clip_min_y, clip_max_y,
+            );
+        };
+
+        // Header: quiet section label on the left, a slightly brighter
+        // status group on the right. The status prefix is dimmed so the
+        // kickoff/clock stays the focal point of the row.
+        let header_y = y + 11.0;
+        let section_title = if match_data.is_upcoming {
+            "UPCOMING MATCH"
+        } else if match_data.is_live {
+            "LIVE SPORTS"
+        } else {
+            "FINAL"
+        };
+        let section_size = 10.5;
+        draw_text(canvas, section_title, x + 16.0, header_y, section_size, muted, true);
+        let section_w = canvas.measure_text_width(section_title, section_size, true);
+
+        let prefix = if match_data.is_live {
+            "LIVE"
+        } else if match_data.is_upcoming {
+            "UP NEXT"
+        } else {
+            ""
+        };
+        let detail = match_data.clock.trim().replace(" at ", " · ");
+        let prefix_size = 9.5;
+        let detail_size = 11.5;
+        let group_gap = 6.0;
+        let prefix_w = if prefix.is_empty() {
+            0.0
+        } else {
+            canvas.measure_text_width(prefix, prefix_size, true)
+        };
+        let available = (bw - 32.0 - section_w - 24.0).max(100.0);
+        let detail_max = (available - prefix_w - group_gap).max(70.0);
+        let detail = canvas.truncate_to_width(&detail, detail_max, detail_size, true);
+        let detail_w = canvas.measure_text_width(&detail, detail_size, true);
+        let detail_x = x + bw - 16.0 - detail_w;
+        let prefix_x = detail_x - group_gap - prefix_w;
+
+        // Only show the prefix when it still leaves a clean gap after the
+        // section label; long status text drops it instead of crowding.
+        if !prefix.is_empty() && prefix_x >= x + 16.0 + section_w + 14.0 {
+            draw_text(
+                canvas,
+                prefix,
+                prefix_x,
+                header_y,
+                prefix_size,
+                Color::from_rgba8(142, 142, 147, alpha_u8),
+                true,
+            );
+        }
+        draw_text(
+            canvas,
+            &detail,
+            detail_x,
+            header_y,
+            detail_size,
+            Color::from_rgba8(255, 255, 255, alpha_u8),
+            true,
+        );
+
+        // Arena: logos, team codes, and scores all share one centerline.
+        let arena_cy = y + 57.0;
+        let logo_size = 32.0;
+        let logo_y = arena_cy - logo_size / 2.0;
+        Self::draw_sports_logo(
+            canvas,
+            match_data.home_logo.as_deref(),
+            x + 4.0,
+            logo_y,
+            logo_size,
+            match_data.home_color,
+            e_text,
+            mask,
+        );
+        Self::draw_sports_logo(
+            canvas,
+            match_data.away_logo.as_deref(),
+            x + bw - logo_size - 4.0,
+            logo_y,
+            logo_size,
+            match_data.away_color,
+            e_text,
+            mask,
+        );
+
+        let team_size = 21.0;
+        let team_color = Color::from_rgba8(238, 238, 242, alpha_u8);
+        let logo_gap = 10.0;
+        let home_text_x = x + 4.0 + logo_size + logo_gap;
+        let away_text_right = x + bw - (4.0 + logo_size + logo_gap);
+        let home_text_y = canvas.text_y_for_vertical_center(
+            &match_data.home_team,
+            team_size,
+            true,
+            arena_cy,
+        );
+        let away_text_y = canvas.text_y_for_vertical_center(
+            &match_data.away_team,
+            team_size,
+            true,
+            arena_cy,
+        );
+        draw_text(
+            canvas,
+            &match_data.home_team,
+            home_text_x,
+            home_text_y,
+            team_size,
+            team_color,
+            true,
+        );
+        let away_w = canvas.measure_text_width(&match_data.away_team, team_size, true);
+        draw_text(
+            canvas,
+            &match_data.away_team,
+            away_text_right - away_w,
+            away_text_y,
+            team_size,
+            team_color,
+            true,
+        );
+
+        // Scores are the visual anchor: larger and brighter than the team
+        // codes, with a quiet vector separator between them.
+        let center_x = x + bw / 2.0;
+        let home_score = match_data.home_score.to_string();
+        let away_score = match_data.away_score.to_string();
+        let score_size = 29.0;
+        let home_score_w = canvas.measure_text_width(&home_score, score_size, true);
+        let score_gap = 22.0;
+        let number_color = Color::from_rgba8(255, 255, 255, alpha_u8);
+        let home_score_y =
+            canvas.text_y_for_vertical_center(&home_score, score_size, true, arena_cy);
+        let away_score_y =
+            canvas.text_y_for_vertical_center(&away_score, score_size, true, arena_cy);
+        draw_text(
+            canvas,
+            &home_score,
+            center_x - score_gap - home_score_w,
+            home_score_y,
+            score_size,
+            number_color,
+            true,
+        );
+        draw_text(
+            canvas,
+            &away_score,
+            center_x + score_gap,
+            away_score_y,
+            score_size,
+            number_color,
+            true,
+        );
+
+        // Use a native vector separator instead of a box-drawing glyph;
+        // the latter renders as missing-glyph squares in the bundled font.
+        let mut separator = Paint::default();
+        separator.anti_alias = true;
+        separator.set_color_rgba8(142, 142, 147, (190.0 * e_text) as u8);
+        let mut separator_path = PathBuilder::new();
+        separator_path.move_to(center_x - 6.0, arena_cy);
+        separator_path.line_to(center_x + 6.0, arena_cy);
+        if let Some(path) = separator_path.finish() {
+            canvas.pixmap.stroke_path(
+                &path,
+                &separator,
+                &Stroke {
+                    width: 2.0,
+                    line_cap: tiny_skia::LineCap::Round,
+                    ..Default::default()
+                },
+                Transform::identity(),
+                mask,
+            );
+        }
+
+        // Keep the optional event note in its own band between the arena
+        // and the tab selector instead of letting it reach the tabs.
+        if let Some(event) = match_data
+            .latest_event
+            .as_deref()
+            .map(str::trim)
+            .filter(|event| !event.is_empty())
+        {
+            let event = canvas.truncate_to_width(event, bw - 32.0, 11.5, false);
+            draw_text(
+                canvas,
+                &event,
+                x + 16.0,
+                y + 86.0,
+                11.5,
+                Color::from_rgba8(200, 200, 206, (180.0 * e_text) as u8),
+                false,
+            );
+        }
+    }
+
+    fn render_match_indicator(
+        canvas: &mut LayeredCanvas,
+        x: f32,
+        y: f32,
+        bw: f32,
+        count: usize,
+        scroll: f32,
+        e_text: f32,
+    ) {
+        let active = (scroll.round() as i32).clamp(0, count as i32 - 1);
+        let cx = x + bw - 4.0;
+        let center_y = y + 57.0;
+
+        if count <= 6 {
+            let gap = 7.0;
+            let total = (count as f32 - 1.0) * gap;
+            let start = center_y - total / 2.0;
+            for index in 0..count {
+                let dot_y = start + index as f32 * gap;
+                let is_active = index as i32 == active;
+                let mut paint = Paint::default();
+                paint.anti_alias = true;
+                let color = if is_active {
+                    Color::from_rgba8(255, 214, 10, (235.0 * e_text) as u8)
+                } else {
+                    Color::from_rgba8(255, 255, 255, (75.0 * e_text) as u8)
+                };
+                paint.set_color(color);
+                let mut pb = PathBuilder::new();
+                pb.push_circle(cx, dot_y, if is_active { 2.0 } else { 1.4 });
+                if let Some(path) = pb.finish() {
+                    canvas.pixmap.fill_path(
+                        &path,
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+        } else {
+            let label = format!("{}/{}", active + 1, count);
+            let tw = canvas.measure_text_width(&label, 9.5, true);
+            canvas.draw_text(
+                &label,
+                cx - tw,
+                center_y + 3.0,
+                9.5,
+                Color::from_rgba8(255, 255, 255, (120.0 * e_text) as u8),
+                true,
             );
         }
     }
@@ -1942,6 +2145,7 @@ impl ExpandedRenderer {
         size: f32,
         team_color: [u8; 4],
         alpha: f32,
+        mask: Option<&Mask>,
     ) {
         let mut background = Paint::default();
         background.anti_alias = true;
@@ -1959,7 +2163,7 @@ impl ExpandedRenderer {
                 &background,
                 tiny_skia::FillRule::Winding,
                 Transform::identity(),
-                None,
+                mask,
             );
         }
 
@@ -2010,7 +2214,7 @@ impl ExpandedRenderer {
                 &logo_paint,
                 tiny_skia::FillRule::Winding,
                 Transform::identity(),
-                None,
+                mask,
             );
         }
     }

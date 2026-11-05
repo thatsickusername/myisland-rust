@@ -14,7 +14,7 @@ use config::*;
 use physics::{rubber_band, ParticleSystem, Spring, SpringPreset};
 use platform::{
     AudioCaptureService, FullscreenDetector, GsmtcService, MediaControlCmd, MediaState,
-    DeviceService, NotificationService, VolumeManager, Win32Window,
+    DeviceService, NotificationService, SportsEvent, VolumeManager, Win32Window,
 };
 use render::{
     build_island_path, AlbumArtManager, LayeredCanvas, MascotEngine, MascotState, ShadowRenderer,
@@ -23,7 +23,7 @@ use render::{
 use tiny_skia::{PathBuilder, Transform};
 use state::{
     fetch_online_artwork, ActivityManager, ActivityType, ClipboardManager, LyricLine, LyricsState,
-    NotificationPayload, SportsState,
+    NotificationPayload, SportsMatchList,
 };
 use ui::{
     CompactRenderer, ExpandedRenderer, TrayIcon, IDM_QUIT, IDM_TEST_CALL, IDM_TEST_DISCORD,
@@ -68,6 +68,16 @@ const HTCLIENT: isize = 1;
 const WM_MOUSEACTIVATE: u32 = 0x0021;
 const MA_ACTIVATE: isize = 1;
 const WM_DEVICECHANGE: u32 = 0x0219;
+
+/// Stable notification ID for a sports event. Hashing the fixture key keeps
+/// simultaneous goals in different matches from colliding on the same ID.
+fn sports_notification_id(base: u64, match_key: &str, salt: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match_key.hash(&mut hasher);
+    salt.hash(&mut hasher);
+    base + (hasher.finish() % 1_000_000_000)
+}
 
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
@@ -332,15 +342,18 @@ fn run_app() -> windows::core::Result<()> {
     let (notif_tx, notif_rx) = crossbeam_channel::unbounded::<NotificationPayload>();
     let (lyrics_tx, lyrics_rx) = crossbeam_channel::unbounded::<(String, Vec<LyricLine>)>();
     let (art_tx, art_rx) = crossbeam_channel::unbounded::<(String, Vec<u8>)>();
-    let (sports_tx, sports_rx) = crossbeam_channel::unbounded::<SportsState>();
+    let (sports_tx, sports_rx) = crossbeam_channel::unbounded::<SportsEvent>();
 
     let gsmtc = GsmtcService::start(media_tx, window.hwnd.0 as isize)?;
     NotificationService::start(notif_tx.clone(), window.hwnd.0 as isize);
     DeviceService::start(notif_tx, window.hwnd.0 as isize);
     crate::platform::SportsService::start(sports_tx);
-    // Track multiple active subscriptions by their matchup key
-    let mut active_matches: std::collections::HashMap<String, SportsState> = std::collections::HashMap::new();
-    let mut latest_sports: Option<SportsState> = None;
+    // Ordered matches for the vertical Matches stack, plus its carousel
+    // spring (same feel as the app-switch spring).
+    let mut sports_matches = SportsMatchList::new();
+    let mut target_match_index: f32 = 0.0;
+    let mut match_spring = Spring::new(0.0, 240.0, 24.0);
+    let mut sports_loading = false;
     let mut goal_celebration_until: Option<Instant> = None;
 
     let tray = TrayIcon::create(
@@ -655,6 +668,12 @@ fn run_app() -> windows::core::Result<()> {
                             let body_w = w_cur - 44.0;
                             let body_h = 82.0;
                             let is_over_body = px >= body_x && px <= body_x + body_w && py >= body_y && py <= body_y + body_h;
+                            // The Matches stack uses the full body band up to
+                            // the camera selector.
+                            let is_over_matches = px >= body_x
+                                && px <= body_x + body_w
+                                && py >= body_y
+                                && py <= body_y + 96.0;
 
                             if current_app == 1 && is_over_body {
                                 // Selective condition: hovering over clipboard panel scrolls clipboard items smoothly, NOT switching apps!
@@ -678,6 +697,16 @@ fn run_app() -> windows::core::Result<()> {
                                         focus_chosen_sec = next_m as u64 * 60;
                                         is_dirty = true;
                                     }
+                                }
+                            } else if current_app == 4 && is_over_matches {
+                                // Matches app: scroll vertically between tracked
+                                // fixtures instead of switching apps.
+                                let count = sports_matches.len();
+                                if count > 1 {
+                                    let dir = if delta < 0 { 1.0 } else { -1.0 };
+                                    target_match_index = (target_match_index + dir)
+                                        .clamp(0.0, (count - 1) as f32);
+                                    is_dirty = true;
                                 }
                             } else {
                                 let dir = if delta < 0 { 1.0 } else { -1.0 };
@@ -1244,74 +1273,110 @@ fn run_app() -> windows::core::Result<()> {
             }
         }
 
-        while let Ok(sports) = sports_rx.try_recv() {
+        while let Ok(event) = sports_rx.try_recv() {
             is_dirty = true;
-            let match_key = format!("{}-{}", sports.home_team, sports.away_team);
-            let is_any_match_live = sports.is_live || active_matches.values().any(|s| s.is_live);
+            match event {
+                SportsEvent::Loading => {
+                    // Config changed (or startup): drop stale matches and show
+                    // a fetching indicator until the worker repopulates.
+                    sports_loading = true;
+                    sports_matches.clear();
+                    target_match_index = 0.0;
+                    match_spring.value = 0.0;
+                    match_spring.target = 0.0;
+                    activity_mgr.update_sports(false);
+                }
+                SportsEvent::Loaded => {
+                    sports_loading = false;
+                    // First full sweep for this config: live games first, then
+                    // freeze the order so cards never move under the user.
+                    sports_matches.sort_initial();
+                    target_match_index = 0.0;
+                    match_spring.value = 0.0;
+                    match_spring.target = 0.0;
+                }
+                SportsEvent::Match(sports) => {
+                    sports_loading = false;
+                    let match_key = format!("{}-{}", sports.home_team, sports.away_team);
+                    let previous = sports_matches.upsert(sports.clone());
 
-            if let Some(prev) = active_matches.get(&match_key) {
-                let home_scored = sports.home_score > prev.home_score;
-                let away_scored = sports.away_score > prev.away_score;
+                    if let Some(prev) = previous {
+                        let home_scored = sports.home_score > prev.home_score;
+                        let away_scored = sports.away_score > prev.away_score;
 
-                if home_scored || away_scored {
-                    // 1. Dispatch high-priority synthetic notification
-                    let msg = format!("GOAL! {} {} - {} {}", sports.home_team, sports.home_score, sports.away_score, sports.away_team);
-                    let brand_col = if home_scored { sports.home_color } else { sports.away_color };
-                    let logo_bytes = if home_scored { sports.home_logo.clone() } else { sports.away_logo.clone() };
+                        if home_scored || away_scored {
+                            // 1. Dispatch high-priority synthetic notification
+                            let msg = format!("GOAL! {} {} - {} {}", sports.home_team, sports.home_score, sports.away_score, sports.away_team);
+                            let brand_col = if home_scored { sports.home_color } else { sports.away_color };
+                            let logo_bytes = if home_scored { sports.home_logo.clone() } else { sports.away_logo.clone() };
 
-                    activity_mgr.push_notification(NotificationPayload {
-                        id: 200 + sports.home_score as u64 + sports.away_score as u64, // Ensures unique ID per goal
-                        app_name: "Live Sports".to_string(),
-                        app_user_model_id: "".to_string(),
-                        badge_app: "sports".to_string(),
-                        title: "Match Update".to_string(),
-                        subtitle: msg,
-                        time_text: "now".to_string(),
-                        is_snip: false,
-                        is_call: false,
-                        is_device: false,
-                        image_preview: None,
-                        icon_image: logo_bytes,
-                        avatar_image: None,
-                        file_path: None,
-                        has_contact_avatar: false,
-                        brand_color: brand_col,
-                    });
+                            activity_mgr.push_notification(NotificationPayload {
+                                // Hash the fixture key so simultaneous goals in
+                                // different matches cannot collide on the same ID.
+                                id: sports_notification_id(
+                                    200_000_000_000,
+                                    &match_key,
+                                    ((sports.home_score as u64) << 32) | sports.away_score as u64,
+                                ),
+                                app_name: "Live Sports".to_string(),
+                                app_user_model_id: "".to_string(),
+                                badge_app: "sports".to_string(),
+                                title: "Match Update".to_string(),
+                                subtitle: msg,
+                                time_text: "now".to_string(),
+                                is_snip: false,
+                                is_call: false,
+                                is_device: false,
+                                image_preview: None,
+                                icon_image: logo_bytes,
+                                avatar_image: None,
+                                file_path: None,
+                                has_contact_avatar: false,
+                                brand_color: brand_col,
+                            });
 
-                    // 2. Trigger hardware celebration hooks
-                    goal_celebration_until = Some(Instant::now() + std::time::Duration::from_secs(5));
-                    particles.launch_confetti((WINDOW_WIDTH as f32) / 2.0, 28.0);
-                    if current_state == IslandState::Rest || current_state == IslandState::Tucked {
-                        current_state = IslandState::Compact; // Supersedes low-priority UI
+                            // 2. Trigger hardware celebration hooks
+                            goal_celebration_until = Some(Instant::now() + std::time::Duration::from_secs(5));
+                            particles.launch_confetti((WINDOW_WIDTH as f32) / 2.0, 28.0);
+                            if current_state == IslandState::Rest || current_state == IslandState::Tucked {
+                                current_state = IslandState::Compact; // Supersedes low-priority UI
+                            }
+                        } else if sports.is_live && !prev.is_live {
+                            // Match just started!
+                            let msg = format!("Kickoff! {} vs {}", sports.home_team, sports.away_team);
+                            activity_mgr.push_notification(NotificationPayload {
+                                id: sports_notification_id(300_000_000_000, &match_key, 0),
+                                app_name: "Live Sports".to_string(),
+                                app_user_model_id: "".to_string(),
+                                badge_app: "sports".to_string(),
+                                title: "Match Started".to_string(),
+                                subtitle: msg,
+                                time_text: "now".to_string(),
+                                is_snip: false,
+                                is_call: false,
+                                is_device: false,
+                                image_preview: None,
+                                icon_image: sports.home_logo.clone(),
+                                avatar_image: None,
+                                file_path: None,
+                                has_contact_avatar: false,
+                                brand_color: sports.home_color,
+                            });
+                        }
                     }
-                } else if sports.is_live && !prev.is_live {
-                    // Match just started!
-                    let msg = format!("Kickoff! {} vs {}", sports.home_team, sports.away_team);
-                    activity_mgr.push_notification(NotificationPayload {
-                        id: 300 + sports.home_score as u64,
-                        app_name: "Live Sports".to_string(),
-                        app_user_model_id: "".to_string(),
-                        badge_app: "sports".to_string(),
-                        title: "Match Started".to_string(),
-                        subtitle: msg,
-                        time_text: "now".to_string(),
-                        is_snip: false,
-                        is_call: false,
-                        is_device: false,
-                        image_preview: None,
-                        icon_image: sports.home_logo.clone(),
-                        avatar_image: None,
-                        file_path: None,
-                        has_contact_avatar: false,
-                        brand_color: sports.home_color,
-                    });
+
+                    // Drop fixtures that have stopped appearing in any feed so
+                    // a long-finished live match cannot keep the pill alive.
+                    sports_matches.prune(std::time::Duration::from_secs(6 * 60 * 60));
+                    let max_index = sports_matches.len().saturating_sub(1) as f32;
+                    target_match_index = target_match_index.clamp(0.0, max_index);
+                    match_spring.target = target_match_index;
+
+                    let is_any_match_live = sports.is_live
+                        || sports_matches.matches().iter().any(|state| state.is_live);
+                    activity_mgr.update_sports(is_any_match_live);
                 }
             }
-
-            active_matches.insert(match_key, sports.clone());
-            // Update the expanded sports carousel to render the latest match in focus
-            latest_sports = Some(sports);
-            activity_mgr.update_sports(is_any_match_live);
         }
 
         activity_mgr.check_notification_expiry();
@@ -1755,6 +1820,13 @@ fn run_app() -> windows::core::Result<()> {
         }
         notes_scroll_progress = notes_spring.value;
 
+        // Matches vertical stack progression (same 240Hz spring as the app
+        // carousel, so page changes feel identical to app switching).
+        match_spring.target = target_match_index;
+        if match_spring.update(dt) || (target_match_index - match_spring.value).abs() > 0.002 {
+            ui_animating = true;
+        }
+
         // Focus timer tick
         let mut focus_left_ms = 0u64;
         let focus_total_ms = focus_chosen_sec * 1000;
@@ -2074,7 +2146,9 @@ fn run_app() -> windows::core::Result<()> {
                     clip_scroll_progress,
                     &mut target_notes_scroll,
                     notes_scroll_progress,
-                    latest_sports.as_ref(),
+                    sports_matches.matches(),
+                    sports_loading,
+                    match_spring.value,
                 )
             };
             if anim {
@@ -2109,7 +2183,11 @@ fn run_app() -> windows::core::Result<()> {
                 is_rest,
                 (w_val / DIMS_COMPACT.w).clamp(0.92, 1.08),
                 volume_stretch_spring.value,
-                latest_sports.as_ref(),
+                sports_matches
+                    .matches()
+                    .iter()
+                    .find(|state| state.is_live)
+                    .or_else(|| sports_matches.matches().first()),
             );
             if anim {
                 ui_animating = true;

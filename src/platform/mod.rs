@@ -6,7 +6,7 @@ pub mod devices;
 pub mod fullscreen;
 pub mod audio_capture;
 pub mod sports;
-pub use sports::SportsService;
+pub use sports::{SportsEvent, SportsService};
 
 pub use win32::Win32Window;
 pub use gsmtc::{GsmtcService, MediaState, MediaControlCmd};
