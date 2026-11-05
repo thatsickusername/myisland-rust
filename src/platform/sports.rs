@@ -1,8 +1,31 @@
 use crossbeam_channel::Sender;
-use std::{collections::HashMap, io::Read, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, io::Read, path::PathBuf, time::Duration};
 
 use crate::state::SportsState;
 use serde_json::Value;
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SportsConfig {
+    pub subscriptions: Vec<TeamSubscription>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TeamSubscription {
+    pub team_abbr: String,
+    pub league_endpoint: String,
+}
+
+impl Default for SportsConfig {
+    fn default() -> Self {
+        Self {
+            subscriptions: vec![TeamSubscription {
+                team_abbr: "ARS".to_string(), // Default fallback
+                league_endpoint: "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard".to_string(),
+            }],
+        }
+    }
+}
 
 pub struct SportsService;
 
@@ -13,20 +36,46 @@ struct ParsedSports {
 }
 
 impl SportsService {
-    pub fn start(tx: Sender<SportsState>, endpoint: String) {
+    pub fn start(tx: Sender<SportsState>) {
         std::thread::spawn(move || {
             let mut logo_cache = HashMap::<String, Vec<u8>>::new();
+            let config_dir = std::env::var("APPDATA")
+                .map(|p| PathBuf::from(p).join("MyIsland"))
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let config_path = config_dir.join("sports_settings.json");
+
+            std::fs::create_dir_all(&config_dir).ok();
+
             loop {
-                Self::poll(&tx, &endpoint, &mut logo_cache);
+                let config = std::fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|data| serde_json::from_str::<SportsConfig>(&data).ok())
+                    .unwrap_or_else(|| {
+                        let default_cfg = SportsConfig::default();
+                        if let Ok(json) = serde_json::to_string_pretty(&default_cfg) {
+                            let _ = std::fs::write(&config_path, json);
+                        }
+                        default_cfg
+                    });
+
+                for sub in &config.subscriptions {
+                    Self::poll(&tx, &sub.league_endpoint, &sub.team_abbr, &mut logo_cache);
+                }
+
                 std::thread::sleep(Duration::from_secs(15));
             }
         });
     }
 
-    fn poll(tx: &Sender<SportsState>, endpoint: &str, logo_cache: &mut HashMap<String, Vec<u8>>) {
+    fn poll(
+        tx: &Sender<SportsState>,
+        endpoint: &str,
+        target_abbr: &str,
+        logo_cache: &mut HashMap<String, Vec<u8>>,
+    ) {
         if let Ok(res) = ureq::get(endpoint).set("User-Agent", "MyIsland/0.1").call() {
             if let Ok(json) = res.into_json::<Value>() {
-                if let Some(parsed) = Self::parse_scoreboard(&json) {
+                if let Some(parsed) = Self::parse_scoreboard(&json, target_abbr) {
                     let mut state = parsed.state;
                     state.home_logo = Self::load_logo(logo_cache, parsed.home_logo_url.as_deref());
                     state.away_logo = Self::load_logo(logo_cache, parsed.away_logo_url.as_deref());
@@ -36,15 +85,20 @@ impl SportsService {
         }
     }
 
-    fn parse_scoreboard(json: &Value) -> Option<ParsedSports> {
+    fn parse_scoreboard(json: &Value, target_abbr: &str) -> Option<ParsedSports> {
         let events = json.get("events")?.as_array()?;
 
-        // Prefer a live event, but keep a completed/upcoming event available so
-        // the panel can show a useful score while the league is between matches.
+        // Find the subscribed team's event, preferring a live match so the
+        // panel shows the most relevant score for that team.
         let event = events
             .iter()
+            .filter(|event| Self::event_has_team(event, target_abbr))
             .find(|event| Self::competition_is_live(event))
-            .or_else(|| events.first())?;
+            .or_else(|| {
+                events
+                    .iter()
+                    .find(|event| Self::event_has_team(event, target_abbr))
+            })?;
         let comp = event.get("competitions")?.as_array()?.first()?;
         let competitors = comp.get("competitors")?.as_array()?;
 
@@ -125,6 +179,24 @@ impl SportsService {
             .or_else(|| status_type.get("shortDetail").and_then(Value::as_str))
             .unwrap_or("Scheduled")
             .to_string()
+    }
+
+    fn event_has_team(event: &Value, target_abbr: &str) -> bool {
+        event
+            .get("competitions")
+            .and_then(Value::as_array)
+            .and_then(|comps| comps.first())
+            .and_then(|c| c.get("competitors"))
+            .and_then(Value::as_array)
+            .map_or(false, |competitors| {
+                competitors.iter().any(|team| {
+                    team.get("team")
+                        .and_then(|t| t.get("abbreviation"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .eq_ignore_ascii_case(target_abbr)
+                })
+            })
     }
 
     fn competition_is_live(event: &Value) -> bool {
@@ -252,7 +324,7 @@ mod tests {
             }]
         });
 
-        let parsed = SportsService::parse_scoreboard(&scoreboard).expect("valid match");
+        let parsed = SportsService::parse_scoreboard(&scoreboard, "EVE").expect("valid match");
         assert_eq!(parsed.state.home_team, "EVE");
         assert_eq!(parsed.state.away_team, "COV");
         assert!(parsed.state.is_upcoming);
@@ -264,10 +336,43 @@ mod tests {
 
     #[test]
     fn empty_or_incomplete_scoreboards_are_ignored() {
-        assert!(SportsService::parse_scoreboard(&json!({ "events": [] })).is_none());
-        assert!(SportsService::parse_scoreboard(&json!({
-            "events": [{ "competitions": [] }]
-        }))
+        assert!(SportsService::parse_scoreboard(&json!({ "events": [] }), "ARS").is_none());
+        assert!(SportsService::parse_scoreboard(
+            &json!({
+                "events": [{ "competitions": [] }]
+            }),
+            "ARS"
+        )
         .is_none());
+    }
+
+    #[test]
+    fn only_subscribed_team_matches_are_selected() {
+        let scoreboard = json!({
+            "events": [
+                {
+                    "competitions": [{
+                        "competitors": [
+                            { "homeAway": "home", "team": { "abbreviation": "LIV" } },
+                            { "homeAway": "away", "team": { "abbreviation": "MCI" } }
+                        ],
+                        "status": { "type": { "state": "in" } }
+                    }]
+                },
+                {
+                    "competitions": [{
+                        "competitors": [
+                            { "homeAway": "home", "team": { "abbreviation": "ARS" } },
+                            { "homeAway": "away", "team": { "abbreviation": "CHE" } }
+                        ],
+                        "status": { "type": { "state": "pre" } }
+                    }]
+                }
+            ]
+        });
+
+        let parsed = SportsService::parse_scoreboard(&scoreboard, "ARS").expect("subscribed match");
+        assert_eq!(parsed.state.home_team, "ARS");
+        assert_eq!(parsed.state.away_team, "CHE");
     }
 }

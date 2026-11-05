@@ -28,7 +28,7 @@ use state::{
 use ui::{
     CompactRenderer, ExpandedRenderer, TrayIcon, IDM_QUIT, IDM_TEST_CALL, IDM_TEST_DISCORD,
     IDM_TEST_CONTROLLER, IDM_TEST_HEADPHONES, IDM_TEST_SPEAKER_DISCONNECT, IDM_TEST_SNIP,
-    IDM_TEST_WHATSAPP, IDM_TOGGLE_EXPAND, IDM_TUCK_AWAY, WM_TRAYICON,
+    IDM_TEST_WHATSAPP, IDM_TOGGLE_EXPAND, IDM_TUCK_AWAY, IDM_SPORTS_SETTINGS, WM_TRAYICON,
 };
 
 #[link(name = "winmm")]
@@ -337,7 +337,9 @@ fn run_app() -> windows::core::Result<()> {
     let gsmtc = GsmtcService::start(media_tx, window.hwnd.0 as isize)?;
     NotificationService::start(notif_tx.clone(), window.hwnd.0 as isize);
     DeviceService::start(notif_tx, window.hwnd.0 as isize);
-    crate::platform::SportsService::start(sports_tx, "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard".to_string());
+    crate::platform::SportsService::start(sports_tx);
+    // Track multiple active subscriptions by their matchup key
+    let mut active_matches: std::collections::HashMap<String, SportsState> = std::collections::HashMap::new();
     let mut latest_sports: Option<SportsState> = None;
     let mut goal_celebration_until: Option<Instant> = None;
 
@@ -479,6 +481,9 @@ fn run_app() -> windows::core::Result<()> {
                             }
                             IDM_TUCK_AWAY => {
                                 current_state = IslandState::Tucked;
+                            }
+                            IDM_SPORTS_SETTINGS => {
+                                crate::ui::settings::open_sports_settings();
                             }
                              IDM_TEST_WHATSAPP => {
                                  activity_mgr.push_notification(NotificationPayload {
@@ -1241,17 +1246,72 @@ fn run_app() -> windows::core::Result<()> {
 
         while let Ok(sports) = sports_rx.try_recv() {
             is_dirty = true;
-            if let Some(ref prev) = latest_sports {
-                if sports.home_score > prev.home_score || sports.away_score > prev.away_score {
+            let match_key = format!("{}-{}", sports.home_team, sports.away_team);
+            let is_any_match_live = sports.is_live || active_matches.values().any(|s| s.is_live);
+
+            if let Some(prev) = active_matches.get(&match_key) {
+                let home_scored = sports.home_score > prev.home_score;
+                let away_scored = sports.away_score > prev.away_score;
+
+                if home_scored || away_scored {
+                    // 1. Dispatch high-priority synthetic notification
+                    let msg = format!("GOAL! {} {} - {} {}", sports.home_team, sports.home_score, sports.away_score, sports.away_team);
+                    let brand_col = if home_scored { sports.home_color } else { sports.away_color };
+                    let logo_bytes = if home_scored { sports.home_logo.clone() } else { sports.away_logo.clone() };
+
+                    activity_mgr.push_notification(NotificationPayload {
+                        id: 200 + sports.home_score as u64 + sports.away_score as u64, // Ensures unique ID per goal
+                        app_name: "Live Sports".to_string(),
+                        app_user_model_id: "".to_string(),
+                        badge_app: "sports".to_string(),
+                        title: "Match Update".to_string(),
+                        subtitle: msg,
+                        time_text: "now".to_string(),
+                        is_snip: false,
+                        is_call: false,
+                        is_device: false,
+                        image_preview: None,
+                        icon_image: logo_bytes,
+                        avatar_image: None,
+                        file_path: None,
+                        has_contact_avatar: false,
+                        brand_color: brand_col,
+                    });
+
+                    // 2. Trigger hardware celebration hooks
                     goal_celebration_until = Some(Instant::now() + std::time::Duration::from_secs(5));
                     particles.launch_confetti((WINDOW_WIDTH as f32) / 2.0, 28.0);
                     if current_state == IslandState::Rest || current_state == IslandState::Tucked {
-                        current_state = IslandState::Compact;
+                        current_state = IslandState::Compact; // Supersedes low-priority UI
                     }
+                } else if sports.is_live && !prev.is_live {
+                    // Match just started!
+                    let msg = format!("Kickoff! {} vs {}", sports.home_team, sports.away_team);
+                    activity_mgr.push_notification(NotificationPayload {
+                        id: 300 + sports.home_score as u64,
+                        app_name: "Live Sports".to_string(),
+                        app_user_model_id: "".to_string(),
+                        badge_app: "sports".to_string(),
+                        title: "Match Started".to_string(),
+                        subtitle: msg,
+                        time_text: "now".to_string(),
+                        is_snip: false,
+                        is_call: false,
+                        is_device: false,
+                        image_preview: None,
+                        icon_image: sports.home_logo.clone(),
+                        avatar_image: None,
+                        file_path: None,
+                        has_contact_avatar: false,
+                        brand_color: sports.home_color,
+                    });
                 }
             }
-            activity_mgr.update_sports(sports.is_live);
+
+            active_matches.insert(match_key, sports.clone());
+            // Update the expanded sports carousel to render the latest match in focus
             latest_sports = Some(sports);
+            activity_mgr.update_sports(is_any_match_live);
         }
 
         activity_mgr.check_notification_expiry();

@@ -20,6 +20,7 @@ pub const IDM_TEST_DISCORD: usize = 1006;
 pub const IDM_TEST_CONTROLLER: usize = 1007;
 pub const IDM_TEST_HEADPHONES: usize = 1008;
 pub const IDM_TEST_SPEAKER_DISCONNECT: usize = 1009;
+pub const IDM_SPORTS_SETTINGS: usize = 1010;
 pub const IDM_QUIT: usize = 1099;
 
 pub struct TrayIcon {
@@ -68,6 +69,8 @@ impl TrayIcon {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_EXPAND, w!("Toggle Expand"));
             let _ = AppendMenuW(menu, MF_STRING, IDM_TUCK_AWAY, w!("Tuck Away"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, IDM_SPORTS_SETTINGS, w!("Sports Settings..."));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_WHATSAPP, w!("Test WhatsApp"));
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_CALL, w!("Test Phone Call"));
