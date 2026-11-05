@@ -31,7 +31,7 @@ impl CompactRenderer {
         clip_copied_banner_until: Option<std::time::Instant>,
         is_rest: bool,
         content_scale: f32,
-        volume_stretch: f32,
+        _volume_stretch: f32,
         sports: Option<&SportsState>,
     ) -> bool {
         let cy = h / 2.0;
@@ -219,8 +219,8 @@ impl CompactRenderer {
 
             let bar_h = 5.0;
             let bar_y = cy - bar_h / 2.0;
-            let stretch = 1.0 + volume_stretch.clamp(-0.18, 0.18);
-            let bar_w = (w - 92.0) * stretch;
+            // The bar width is now cohesively locked to the physical island width 'w'
+            let bar_w = (w - 92.0).max(10.0);
             let bar_x = island_x + (w - bar_w) / 2.0;
 
             // Track

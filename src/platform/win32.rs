@@ -4,6 +4,7 @@ use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HBRUSH, 
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_SPACE,
+    VK_VOLUME_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetCursorPos, RegisterClassExW, ShowWindow, SW_SHOWNOACTIVATE, WNDCLASSEXW,
@@ -15,6 +16,9 @@ pub const WINDOW_HEIGHT: i32 = 340;
 
 pub const HOTKEY_TOGGLE_TUCK: i32 = 1;
 pub const HOTKEY_TOGGLE_EXPAND: i32 = 2;
+pub const HOTKEY_VOL_UP: i32 = 3;
+pub const HOTKEY_VOL_DOWN: i32 = 4;
+pub const HOTKEY_VOL_MUTE: i32 = 5;
 
 pub struct Win32Window {
     pub hwnd: HWND,
@@ -94,6 +98,11 @@ impl Win32Window {
                 MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
                 VK_SPACE.0 as u32,
             );
+
+            // Intercept hardware media keys to suppress the native Windows volume toast
+            let _ = RegisterHotKey(hwnd, HOTKEY_VOL_UP, Default::default(), VK_VOLUME_UP.0 as u32);
+            let _ = RegisterHotKey(hwnd, HOTKEY_VOL_DOWN, Default::default(), VK_VOLUME_DOWN.0 as u32);
+            let _ = RegisterHotKey(hwnd, HOTKEY_VOL_MUTE, Default::default(), VK_VOLUME_MUTE.0 as u32);
 
             // Add clipboard format listener for event-driven clipboard updates
             let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);

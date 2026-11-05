@@ -400,6 +400,33 @@ fn run_app() -> windows::core::Result<()> {
                             } else {
                                 IslandState::Expanded
                             };
+                        } else if id == platform::win32::HOTKEY_VOL_UP || id == platform::win32::HOTKEY_VOL_DOWN {
+                            let (vol, _) = volume_mgr.read();
+                            // Standard Windows hardware volume step is 2.0
+                            let delta_vol = if id == platform::win32::HOTKEY_VOL_UP { 2.0 } else { -2.0 };
+                            let new_vol = (vol + delta_vol).clamp(0.0, 100.0);
+                            volume_mgr.set_volume(new_vol);
+
+                            if current_state != IslandState::Tucked && current_state != IslandState::Expanded {
+                                volume_spring.target = new_vol;
+                                volume_stretch_spring.target = 0.0;
+                                let visual_delta = if id == platform::win32::HOTKEY_VOL_UP { 120.0 } else { -120.0 };
+                                volume_stretch_spring.impulse(visual_delta * 0.008);
+                                spring_w.impulse(visual_delta * 0.45);
+                                
+                                current_state = IslandState::Compact;
+                                is_volume_hud_active = true;
+                                volume_hud_until = Instant::now() + std::time::Duration::from_millis(2500);
+                            }
+                        } else if id == platform::win32::HOTKEY_VOL_MUTE {
+                            let (_, muted) = volume_mgr.read();
+                            volume_mgr.set_mute(!muted);
+
+                            if current_state != IslandState::Tucked && current_state != IslandState::Expanded {
+                                current_state = IslandState::Compact;
+                                is_volume_hud_active = true;
+                                volume_hud_until = Instant::now() + std::time::Duration::from_millis(2500);
+                            }
                         }
                     }
                     WM_CLIPBOARDUPDATE => {
@@ -609,6 +636,9 @@ fn run_app() -> windows::core::Result<()> {
                             volume_spring.target = new_vol;
                             volume_stretch_spring.target = 0.0;
                             volume_stretch_spring.impulse((delta as f32) * 0.008);
+                            // Apply physical momentum directly to the island's width spring
+                            // so the entire container breathes cohesively with the scroll.
+                            spring_w.impulse((delta as f32) * 0.18);
                             is_volume_hud_active = true;
                             volume_hud_until = Instant::now() + std::time::Duration::from_millis(2500);
                         } else if current_state == IslandState::Expanded {
