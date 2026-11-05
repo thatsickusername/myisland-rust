@@ -385,7 +385,7 @@ impl ExpandedRenderer {
         w: f32,
         h: f32,
         content_entrance: f32,
-        current_app: usize,
+        _current_app: usize, // <-- Prefixed with underscore
         scroll_progress: f32,
         pointer_x: f32,
         pointer_y: f32,
@@ -500,31 +500,47 @@ impl ExpandedRenderer {
             canvas.pixmap.stroke_path(&p, &div_paint, &stroke_1, Transform::identity(), None);
         }
 
-        // 5. Active App Panel
-        let body_x = island_x + 22.0;
+        // 5. Active App Panels (Sliding Carousel)
         let body_y = 44.0 + 9.0 * (1.0 - e_text);
         let body_w = w - 44.0;
+        let center_slot = scroll_progress.round() as i32;
 
-        match current_app {
-            0 => Self::render_music(canvas, album_art, body_x, body_y, body_w, pointer_x, pointer_y, media, lyrics, e_album, e_text, e_controls),
-            1 => Self::render_clipboard(canvas, body_x, body_y, body_w, h, content_alpha, clips, pointer_x, pointer_y, clip_copied_index, clip_scroll_progress),
-            2 => Self::render_notes(canvas, body_x, body_y, body_w, clips, notes_focused, notes_cursor_pos, cursor_moved, target_notes_scroll, notes_scroll_progress),
-            3 => Self::render_focus(
-                canvas,
-                body_x,
-                body_y,
-                body_w,
-                pointer_x,
-                pointer_y,
-                focus_active,
-                focus_paused,
-                focus_left_ms,
-                focus_total_ms,
-                focus_chosen_sec,
-                ruler_visual_mins,
-            ),
-            4 => Self::render_sports(canvas, body_x, body_y, body_w, sports, e_text),
-            _ => {}
+        for offset in -1..=1 {
+            let slot = center_slot + offset;
+            let offset_dist = (slot as f32) - scroll_progress;
+            
+            // Skip rendering adjacent panels once they are fully outside the clipping mask
+            if offset_dist.abs() >= 1.0 {
+                continue;
+            }
+            
+            let app_idx = (((slot % 5) + 5) % 5) as usize;
+            
+            // Translate the panel horizontally by the island's full width
+            let panel_dx = offset_dist * w; 
+            let body_x = island_x + 22.0 + panel_dx;
+
+            match app_idx {
+                0 => Self::render_music(canvas, album_art, body_x, body_y, body_w, pointer_x, pointer_y, media, lyrics, e_album, e_text, e_controls),
+                1 => Self::render_clipboard(canvas, body_x, body_y, body_w, h, content_alpha, clips, pointer_x, pointer_y, clip_copied_index, clip_scroll_progress),
+                2 => Self::render_notes(canvas, body_x, body_y, body_w, clips, notes_focused, notes_cursor_pos, cursor_moved, target_notes_scroll, notes_scroll_progress),
+                3 => Self::render_focus(
+                    canvas,
+                    body_x,
+                    body_y,
+                    body_w,
+                    pointer_x,
+                    pointer_y,
+                    focus_active,
+                    focus_paused,
+                    focus_left_ms,
+                    focus_total_ms,
+                    focus_chosen_sec,
+                    ruler_visual_mins,
+                ),
+                4 => Self::render_sports(canvas, body_x, body_y, body_w, sports, e_text),
+                _ => {}
+            }
         }
 
         // 6. iPhone Camera Mode Selector (Carousel) - only shows when island is tall enough
