@@ -70,7 +70,7 @@ impl TrayIcon {
             let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE_EXPAND, w!("Toggle Expand"));
             let _ = AppendMenuW(menu, MF_STRING, IDM_TUCK_AWAY, w!("Tuck Away"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MF_STRING, IDM_SPORTS_SETTINGS, w!("Sports Settings..."));
+            let _ = AppendMenuW(menu, MF_STRING, IDM_SPORTS_SETTINGS, w!("Settings..."));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_WHATSAPP, w!("Test WhatsApp"));
             let _ = AppendMenuW(menu, MF_STRING, IDM_TEST_CALL, w!("Test Phone Call"));
