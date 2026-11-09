@@ -572,9 +572,10 @@ impl CompactRenderer {
 
                 // Vector replacement for the unsupported emoji status marker.
                 if match_data.is_live {
+                    let pulse = 0.6 + 0.4 * (t * 5.0).sin();
                     let mut dot_paint = Paint::default();
                     dot_paint.anti_alias = true;
-                    dot_paint.set_color_rgba8(48, 209, 88, 255); // Apple emerald #30d158
+                    dot_paint.set_color_rgba8(48, 209, 88, (pulse * 255.0) as u8); // Apple emerald #30d158
                     let mut dot_path = PathBuilder::new();
                     dot_path.push_circle(center_start_x + center_w + 8.0, cy, 3.5);
                     if let Some(path) = dot_path.finish() {
@@ -586,6 +587,7 @@ impl CompactRenderer {
                             None,
                         );
                     }
+                    is_animating = true;
                 }
             }
         } else {

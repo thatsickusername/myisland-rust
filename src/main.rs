@@ -80,6 +80,7 @@ fn sports_notification_id(base: u64, match_key: &str, salt: u64) -> u64 {
 }
 
 /// Aggregate two damage rectangles into the smallest rect that contains both.
+#[allow(dead_code)]
 fn union_rect(a: RECT, b: RECT) -> RECT {
     RECT {
         left: a.left.min(b.left),
@@ -93,6 +94,7 @@ fn union_rect(a: RECT, b: RECT) -> RECT {
 /// The drop shadow and the rest of the canvas are static, so the island band
 /// (plus enough margin for the largest shadow blur) is the only area that can
 /// change.
+#[allow(dead_code)]
 fn island_damage_rect(island_x: f32, island_w: f32, island_h: f32, secondary_h: f32) -> RECT {
     let pad = 52.0;
     RECT {
@@ -422,6 +424,7 @@ fn run_app() -> windows::core::Result<()> {
     // Ordered matches for the vertical Matches stack, plus its carousel
     // spring (same feel as the app-switch spring).
     let mut sports_matches = SportsMatchList::new();
+
     let mut target_match_index: f32 = 0.0;
     let mut match_spring = Spring::new(0.0, 240.0, 24.0);
     let mut sports_loading = false;
@@ -463,6 +466,7 @@ fn run_app() -> windows::core::Result<()> {
     }
 
     // Use for updates known to stay inside a sub-region of the canvas.
+    #[allow(unused_macros)]
     macro_rules! mark_dirty_rect {
         ($rect:expr) => {{
             let damage: RECT = $rect;
@@ -2083,17 +2087,8 @@ fn run_app() -> windows::core::Result<()> {
             || is_volume_hud_active
             || activity_mgr.active_notification.is_some();
 
-        if has_motion {
+        if has_motion || (latest_media.is_playing && current_state != IslandState::Tucked) {
             mark_dirty_full!();
-        } else if latest_media.is_playing && current_state != IslandState::Tucked {
-            // Media-only tick (progress / lyrics / visualizer): the shadow and
-            // outer canvas are static, so only the island band is damaged.
-            mark_dirty_rect!(island_damage_rect(
-                island_x,
-                w_val,
-                h_val,
-                sec_spring_h.value
-            ));
         }
 
         // 9. Render Frame (Only when visual state is dirty)
@@ -2237,6 +2232,9 @@ fn run_app() -> windows::core::Result<()> {
                     let display_sec = sec_act.or(last_secondary_app);
 
                     if display_sec == Some(ActivityType::Focus) {
+                        if focus_active && !focus_paused {
+                            ui_animating = true;
+                        }
                         // Circular timer progress icon in secondary pill (MyIsland index.html lines 3116-3132)
                         let left_sec_ms = if focus_active { focus_left_ms } else { 0 };
                         let sec_frac = if focus_total_ms > 0 {
@@ -2278,6 +2276,9 @@ fn run_app() -> windows::core::Result<()> {
                             }
                         }
                     } else if display_sec == Some(ActivityType::Music) {
+                        if latest_media.is_playing {
+                            ui_animating = true;
+                        }
                         // Mini visualizer in secondary pill (MyIsland index.html line 3135)
                         let bar_color = tiny_skia::Color::from_rgba8(
                             album_art_mgr.dominant_color[0],
@@ -2509,29 +2510,7 @@ fn run_app() -> windows::core::Result<()> {
             || (latest_media.is_playing && current_state != IslandState::Tucked);
 
         if needs_next_frame {
-            // Only the media tick needs the next frame when nothing else is
-            // moving; keep that next frame's damage local to the island band.
-            let motion_next = springs_moving
-                || leave_timer_start.is_some()
-                || expanded_leave_timer.is_some()
-                || particles_moving
-                || ui_animating
-                || cursor_active
-                || is_dragging_ruler
-                || (focus_active && !focus_paused)
-                || activity_mgr.active_notification.is_some()
-                || is_volume_hud_active
-                || clip_copied_banner_until.is_some();
-            if !motion_next && latest_media.is_playing && current_state != IslandState::Tucked {
-                mark_dirty_rect!(island_damage_rect(
-                    island_x,
-                    w_val,
-                    h_val,
-                    sec_spring_h.value
-                ));
-            } else {
-                mark_dirty_full!();
-            }
+            mark_dirty_full!();
             let dwm_res = unsafe { windows::Win32::Graphics::Dwm::DwmFlush() };
             if dwm_res.is_err() {
                 let sleep_ms = if springs_moving || particles_moving { 8 } else { 16 };

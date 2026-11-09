@@ -8,7 +8,7 @@ use tiny_skia::{Color, FillRule, Mask, Pixmap, PixmapPaint, Transform};
 use windows::Win32::Foundation::{BOOL, HMODULE, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DYNAMIC,
@@ -509,7 +509,7 @@ impl LayeredCanvas {
         self.present(hwnd, window_x, window_y);
     }
 
-    fn present_hardware(&mut self, dirty_rect: Option<RECT>) -> bool {
+    fn present_hardware(&mut self, _dirty_rect: Option<RECT>) -> bool {
         let (Some(context), Some(swapchain), Some(upload)) = (
             self.d3d_context.as_ref(),
             self.swapchain.as_ref(),
@@ -523,25 +523,6 @@ impl LayeredCanvas {
         if width == 0 || height == 0 {
             return true;
         }
-
-        let rect = clamp_rect(
-            dirty_rect.unwrap_or(RECT {
-                left: 0,
-                top: 0,
-                right: self.width,
-                bottom: self.height,
-            }),
-            self.width,
-            self.height,
-        );
-        if rect.right <= rect.left || rect.bottom <= rect.top {
-            return true;
-        }
-
-        let is_full = rect.left == 0
-            && rect.top == 0
-            && rect.right == self.width
-            && rect.bottom == self.height;
 
         unsafe {
             let backbuffer: ID3D11Texture2D = match swapchain.GetBuffer(0) {
@@ -564,23 +545,19 @@ impl LayeredCanvas {
             }
 
             // tiny-skia produces premultiplied RGBA; the swapchain expects
-            // premultiplied BGRA. Only the damaged span is converted, so a
-            // small lyrics tick does not touch the full 860x340 surface.
+            // premultiplied BGRA. Convert the full surface so backbuffer flips
+            // stay completely clean without ghosting, stale buffers, or compositor tearing.
             let src = self.pixmap.data();
             let src_pixels =
                 std::slice::from_raw_parts(src.as_ptr() as *const u32, width * height);
             let dst_base = mapped.pData as *mut u8;
             let row_pitch = mapped.RowPitch as usize;
-            let x0 = rect.left as usize;
-            let y0 = rect.top as usize;
-            let x1 = rect.right as usize;
-            let y1 = rect.bottom as usize;
 
-            for y in y0..y1 {
-                let src_row = &src_pixels[y * width + x0..y * width + x1];
+            for y in 0..height {
+                let src_row = &src_pixels[y * width..(y + 1) * width];
                 let dst_row = std::slice::from_raw_parts_mut(
                     dst_base.add(y * row_pitch) as *mut u32,
-                    x1 - x0,
+                    width,
                 );
                 for (src_px, dst_px) in src_row.iter().zip(dst_row.iter_mut()) {
                     let px = *src_px;
@@ -592,38 +569,9 @@ impl LayeredCanvas {
 
             context.Unmap(upload, 0);
 
-            if is_full {
-                context.CopyResource(&backbuffer, upload);
-            } else {
-                // FLIP_SEQUENTIAL preserves the untouched area of the
-                // backbuffer, so only the damaged sub-rect needs copying.
-                let src_box = D3D11_BOX {
-                    left: x0 as u32,
-                    top: y0 as u32,
-                    front: 0,
-                    right: x1 as u32,
-                    bottom: y1 as u32,
-                    back: 1,
-                };
-                context.CopySubresourceRegion(
-                    &backbuffer,
-                    0,
-                    x0 as u32,
-                    y0 as u32,
-                    0,
-                    upload,
-                    0,
-                    Some(&src_box),
-                );
-            }
+            context.CopyResource(&backbuffer, upload);
 
-            let mut present_params = DXGI_PRESENT_PARAMETERS::default();
-            let mut dirty = rect;
-            if !is_full {
-                present_params.DirtyRectsCount = 1;
-                present_params.pDirtyRects = &mut dirty;
-            }
-
+            let present_params = DXGI_PRESENT_PARAMETERS::default();
             swapchain.Present1(1, DXGI_PRESENT(0), &present_params).is_ok()
         }
     }
@@ -936,6 +884,7 @@ impl LayeredCanvas {
     }
 }
 
+#[allow(dead_code)]
 fn clamp_rect(rect: RECT, width: i32, height: i32) -> RECT {
     RECT {
         left: rect.left.clamp(0, width),

@@ -117,6 +117,13 @@ impl ActivityManager {
             }
         }
 
+        // Live sports only renders on the main island; if active, prioritize
+        // it as primary so any secondary activity (Music/Focus) gets the side island.
+        if self.stack.contains(&ActivityType::Sports) {
+            let other = self.stack.iter().rev().copied().find(|&a| a != ActivityType::Sports);
+            return (Some(ActivityType::Sports), other);
+        }
+
         match self.stack.len() {
             0 => (None, None),
             1 => (Some(self.stack[0]), None),
