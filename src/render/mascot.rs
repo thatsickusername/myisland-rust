@@ -42,6 +42,7 @@ pub struct MascotEngine {
     pub is_cursor_over_eyes: bool,
     pub has_triggered_hover_reaction: bool,
     pub hover_start_time: Option<Instant>,
+    pub enabled: bool,
 
     start_instant: Instant,
 }
@@ -71,6 +72,7 @@ impl MascotEngine {
             is_cursor_over_eyes: false,
             has_triggered_hover_reaction: false,
             hover_start_time: None,
+            enabled: true,
 
             start_instant: now,
         }
@@ -196,6 +198,9 @@ impl MascotEngine {
         is_focus_running: bool,
         is_rest: bool,
     ) -> bool {
+        if !self.enabled {
+            return false;
+        }
         let now = Instant::now();
         let now_ms = now.duration_since(self.start_instant).as_millis() as f32;
 

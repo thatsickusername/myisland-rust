@@ -388,6 +388,11 @@ fn run_app() -> windows::core::Result<()> {
     let mut suppress_expand_until: Option<Instant> = None;
     let mut notes_focused = false;
     let mut notes_cursor_pos: usize = clipboard_mgr.note_text.len();
+
+    let mut app_settings = crate::ui::settings::load_app_settings();
+    crate::platform::haptics::set_haptics_enabled(app_settings.general.haptic_feedback);
+    mascot.enabled = app_settings.general.mascot_enabled;
+    let mut last_settings_reload = Instant::now();
     let mut prev_notes_cursor_pos: usize = notes_cursor_pos;
 
     // Notification hover behavior mirrors the Electron island: expandable
@@ -759,6 +764,7 @@ fn run_app() -> windows::core::Result<()> {
                     }
                     WM_MOUSEWHEEL => {
                         let delta = (msg.wParam.0 >> 16) as i16;
+                        crate::platform::haptics::play_scroll_haptic();
                         if current_state == IslandState::Compact {
                             let (vol, _) = volume_mgr.read();
                             let step = if delta > 0 { 4.0 } else { -4.0 };
@@ -835,6 +841,7 @@ fn run_app() -> windows::core::Result<()> {
                         }
                     }
                     WM_LBUTTONDOWN => {
+                        crate::platform::haptics::play_click_haptic();
                         let (px, py, _) = window.get_cursor_relative();
                         let w_cur = spring_w.value;
                         let island_x_cur = ((WINDOW_WIDTH as f32) - w_cur) / 2.0;
@@ -1524,8 +1531,22 @@ fn run_app() -> windows::core::Result<()> {
             lyrics.tick(extrapolated_progress);
         }
 
+        let now = Instant::now();
+
+        // Reload settings periodically (every 1 second)
+        if now.duration_since(last_settings_reload) > std::time::Duration::from_secs(1) {
+            last_settings_reload = now;
+            let loaded = crate::ui::settings::load_app_settings();
+            if loaded != app_settings {
+                app_settings = loaded;
+                crate::platform::haptics::set_haptics_enabled(app_settings.general.haptic_feedback);
+                mascot.enabled = app_settings.general.mascot_enabled;
+                mark_dirty_full!();
+            }
+        }
+
         // Check Fullscreen Auto-Tuck
-        let is_fs = fullscreen_detector.check_fullscreen(window.hwnd);
+        let is_fs = app_settings.general.hide_in_fullscreen && fullscreen_detector.check_fullscreen(window.hwnd);
         if is_fs && !is_auto_tucked {
             is_auto_tucked = true;
             if current_state != IslandState::Tucked {
@@ -1920,6 +1941,16 @@ fn run_app() -> windows::core::Result<()> {
             } else {
                 goal_celebration_until = None;
             }
+        }
+
+        // Apply notch scale setting only to Compact and Rest states (Expanded view stays fixed)
+        let scale = if current_state == IslandState::Compact || current_state == IslandState::Rest {
+            notch_scale(app_settings.general.notch_size)
+        } else {
+            1.0
+        };
+        if scale != 1.0 {
+            target_dims = scaled_dims(target_dims, scale);
         }
 
         // Active press bounce: compress the membrane while the button is held.

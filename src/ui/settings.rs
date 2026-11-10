@@ -17,6 +17,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::platform::sports::{SportsConfig, TeamSubscription};
 use crate::render::canvas::LayeredCanvas;
 
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+};
+
 // Window metrics
 const WIN_WIDTH: i32 = 820;
 const WIN_HEIGHT: i32 = 560;
@@ -52,21 +57,27 @@ const TABS: [(SettingsTab, &str, (u8, u8, u8)); 7] = [
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct GeneralSettings {
     pub start_with_windows: bool,
-    pub notch_size: usize, // 0: Auto, 1: 100%, 2: 115%, 3: 130%, 4: 150%
+    pub notch_size: usize, // 0: Small (85%), 1: Medium (100%), 2: Large (115%)
+    #[serde(default)]
     pub minimal_notch: bool,
     pub mascot_enabled: bool,
-    pub reminder_sounds: bool,
+    #[serde(default = "default_true")]
+    pub haptic_feedback: bool,
     pub hide_in_fullscreen: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             start_with_windows: false,
-            notch_size: 1, // 100%
+            notch_size: 1, // Medium (100%)
             minimal_notch: false,
             mascot_enabled: true,
-            reminder_sounds: true,
+            haptic_feedback: true,
             hide_in_fullscreen: true,
         }
     }
@@ -263,7 +274,7 @@ fn config_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn load_app_settings() -> AppSettings {
+pub fn load_app_settings() -> AppSettings {
     let dir = config_dir();
     let unified_path = dir.join("settings.json");
     if let Ok(data) = std::fs::read_to_string(&unified_path) {
@@ -283,9 +294,54 @@ fn load_app_settings() -> AppSettings {
     settings
 }
 
-fn save_app_settings(settings: &AppSettings) {
+fn set_startup_registry(enabled: bool) {
+    let subkey = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let app_name = w!("MyIsland");
+
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey,
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+        .is_ok()
+        {
+            if enabled {
+                if let Ok(exe_path) = std::env::current_exe() {
+                    let mut path_str = exe_path.to_string_lossy().to_string();
+                    if !path_str.starts_with('"') {
+                        path_str = format!("\"{}\"", path_str);
+                    }
+                    let wide: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
+                    let byte_len = (wide.len() * 2) as u32;
+                    let _ = RegSetValueExW(
+                        hkey,
+                        app_name,
+                        0,
+                        REG_SZ,
+                        Some(std::slice::from_raw_parts(wide.as_ptr() as *const u8, byte_len as usize)),
+                    );
+                }
+            } else {
+                let _ = RegDeleteValueW(hkey, app_name);
+            }
+            let _ = RegCloseKey(hkey);
+        }
+    }
+}
+
+pub fn save_app_settings(settings: &AppSettings) {
     let dir = config_dir();
     let _ = std::fs::create_dir_all(&dir);
+    set_startup_registry(settings.general.start_with_windows);
+    crate::platform::haptics::set_haptics_enabled(settings.general.haptic_feedback);
     let s_clone = settings.clone();
     std::thread::spawn(move || {
         let dir = config_dir();
@@ -337,6 +393,7 @@ pub fn open_sports_settings() {
         };
 
         let settings = load_app_settings();
+        crate::platform::haptics::set_haptics_enabled(settings.general.haptic_feedback);
         let available_teams = Arc::new(Mutex::new(Vec::new()));
 
         // Create window with borderless popup style and alpha composition capability
@@ -554,6 +611,7 @@ unsafe extern "system" fn settings_wnd_proc(
             }
 
             if let Some(id) = clicked_id {
+                crate::platform::haptics::play_click_haptic();
                 handle_element_click(hwnd, state, id);
             } else if state.search_focused {
                 state.search_focused = false;
@@ -675,12 +733,8 @@ unsafe fn handle_element_click(hwnd: HWND, state: &mut DialogState, id: u32) {
                     state.settings.general.start_with_windows = !state.settings.general.start_with_windows;
                     changed = true;
                 }
-                101..=105 => {
+                101..=103 => {
                     state.settings.general.notch_size = (id - 101) as usize;
-                    changed = true;
-                }
-                110 => {
-                    state.settings.general.minimal_notch = !state.settings.general.minimal_notch;
                     changed = true;
                 }
                 111 => {
@@ -688,7 +742,7 @@ unsafe fn handle_element_click(hwnd: HWND, state: &mut DialogState, id: u32) {
                     changed = true;
                 }
                 112 => {
-                    state.settings.general.reminder_sounds = !state.settings.general.reminder_sounds;
+                    state.settings.general.haptic_feedback = !state.settings.general.haptic_feedback;
                     changed = true;
                 }
                 113 => {
@@ -1180,7 +1234,7 @@ fn render_general_tab(state: &mut DialogState, x: f32, mut y: f32, w: f32) {
     draw_section_header(&mut state.canvas, x, y, "NOTCH");
     y += 20.0;
 
-    let notch_card_h = 186.0;
+    let notch_card_h = 136.0;
     draw_card_background(&mut state.canvas, x, y, w, notch_card_h);
 
     // Row 1: Size Segmented Control
@@ -1189,9 +1243,9 @@ fn render_general_tab(state: &mut DialogState, x: f32, mut y: f32, w: f32) {
         x + 16.0,
         y + 24.0,
         "Size",
-        Some("MyIsland scales dimensions to match selected density"),
+        Some("MyIsland scales membrane and content elements proportionally"),
     );
-    let size_options = ["Auto", "100%", "115%", "130%", "150%"];
+    let size_options = ["Small", "Medium", "Large"];
     draw_segmented_control(
         state,
         101,
@@ -1205,27 +1259,15 @@ fn render_general_tab(state: &mut DialogState, x: f32, mut y: f32, w: f32) {
 
     draw_divider(&mut state.canvas, x + 16.0, y + 84.0, w - 32.0);
 
-    // Row 2: Minimal notch
+    // Row 2: Mascot
     draw_card_row_text(
         &mut state.canvas,
         x + 16.0,
         y + 110.0,
-        "Minimal notch",
-        Some("A smaller pill when nothing is playing"),
-    );
-    draw_toggle(state, 110, x + w - 56.0, y + 98.0, state.settings.general.minimal_notch);
-
-    draw_divider(&mut state.canvas, x + 16.0, y + 136.0, w - 32.0);
-
-    // Row 3: Mascot
-    draw_card_row_text(
-        &mut state.canvas,
-        x + 16.0,
-        y + 160.0,
         "Mascot",
         Some("A dynamic friend that blinks, gazes, and reacts in the notch"),
     );
-    draw_toggle(state, 111, x + w - 56.0, y + 148.0, state.settings.general.mascot_enabled);
+    draw_toggle(state, 111, x + w - 56.0, y + 98.0, state.settings.general.mascot_enabled);
 
     y += notch_card_h + 20.0;
 
@@ -1239,10 +1281,10 @@ fn render_general_tab(state: &mut DialogState, x: f32, mut y: f32, w: f32) {
         &mut state.canvas,
         x + 16.0,
         y + 28.0,
-        "Reminder sounds",
-        Some("Subtle audio chimes for focus timers and alerts"),
+        "Haptic feedback",
+        Some("Tactile audio ticks when clicking interactive elements and scrolling"),
     );
-    draw_toggle(state, 112, x + w - 56.0, y + 16.0, state.settings.general.reminder_sounds);
+    draw_toggle(state, 112, x + w - 56.0, y + 16.0, state.settings.general.haptic_feedback);
 
     y += sound_h + 20.0;
 
